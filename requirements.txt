@@ -16,7 +16,6 @@ pyotp==2.9.0
 
 # Technical Analysis
 pandas_ta==0.3.14b
-TA-Lib==0.4.28
 
 # Market Data
 yfinance==0.2.40
