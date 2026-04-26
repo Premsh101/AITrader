@@ -18,6 +18,19 @@ services:
       db:
         condition: service_healthy
 
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    container_name: aitrader_dashboard
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+    depends_on:
+      - app
+
   db:
     image: postgres:16-alpine
     container_name: aitrader_db
