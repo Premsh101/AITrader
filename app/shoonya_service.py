@@ -11,9 +11,11 @@ The ShoonyaEngine class:
 
 import logging
 import os
+import time
 from datetime import datetime, timezone
 
 import pandas as pd
+import requests
 from sqlalchemy.orm import Session
 
 from app.models import SystemConfig, Trade, TradeMode, TradeStatus
@@ -92,6 +94,23 @@ class ShoonyaEngine:
     # Market data
     # ------------------------------------------------------------------
 
+    # User-Agent that mimics a standard Chrome browser on Windows so that
+    # Yahoo Finance does not identify the request as a server-side scraper
+    # and block it (the most common cause of JSONDecodeError on a VPS).
+    _YF_USER_AGENT = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+    _YF_MAX_RETRIES = 3
+    _YF_RETRY_BACKOFF = 5  # seconds between retries
+
+    def _yf_session(self) -> requests.Session:
+        """Return a requests Session with a browser-like User-Agent header."""
+        session = requests.Session()
+        session.headers.update({"User-Agent": self._YF_USER_AGENT})
+        return session
+
     def get_market_data(
         self,
         symbols: list[str],
@@ -102,6 +121,11 @@ class ShoonyaEngine:
         In Paper mode (or when the Shoonya API is unavailable) data is fetched
         from Yahoo Finance via *yfinance*.  Symbols must be in Yahoo Finance
         format (e.g. ``"RELIANCE.NS"``).
+
+        A custom requests Session with a browser User-Agent is injected so that
+        Yahoo Finance does not block VPS/server traffic.  Failed batches are
+        retried up to ``_YF_MAX_RETRIES`` times with ``_YF_RETRY_BACKOFF``-second
+        delays before being skipped.
 
         Args:
             symbols: List of ticker symbols (Yahoo Finance format).
@@ -115,37 +139,57 @@ class ShoonyaEngine:
 
         result: dict[str, pd.DataFrame] = {}
         batch_size = 100  # yfinance handles ~100 tickers efficiently per call
+        session = self._yf_session()
 
         for i in range(0, len(symbols), batch_size):
             batch = symbols[i : i + batch_size]
-            try:
-                raw = yf.download(
-                    tickers=batch,
-                    period=period,
-                    interval="1d",
-                    group_by="ticker",
-                    auto_adjust=True,
-                    progress=False,
-                    threads=True,
-                )
-                if raw.empty:
-                    continue
+            raw = None
 
-                for sym in batch:
-                    try:
-                        if len(batch) == 1:
-                            df = raw.copy()
-                        else:
-                            df = raw[sym].copy()
-                        df = df.dropna(how="all")
-                        if df.empty or len(df) < 30:
-                            continue
-                        df.columns = [c.lower() for c in df.columns]
-                        result[sym] = df
-                    except (KeyError, TypeError):
-                        pass
-            except Exception:
-                logger.exception("Market data fetch failed for batch starting at index %d", i)
+            for attempt in range(1, self._YF_MAX_RETRIES + 1):
+                try:
+                    raw = yf.download(
+                        tickers=batch,
+                        period=period,
+                        interval="1d",
+                        group_by="ticker",
+                        auto_adjust=True,
+                        progress=False,
+                        threads=True,
+                        session=session,
+                    )
+                    if raw is not None and not raw.empty:
+                        break  # successful download
+                    logger.warning(
+                        "Empty data for batch at index %d (attempt %d/%d) – retrying in %ds",
+                        i, attempt, self._YF_MAX_RETRIES, self._YF_RETRY_BACKOFF,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Market data fetch failed for batch at index %d (attempt %d/%d)",
+                        i, attempt, self._YF_MAX_RETRIES,
+                    )
+                if attempt < self._YF_MAX_RETRIES:
+                    time.sleep(self._YF_RETRY_BACKOFF)
+
+            if raw is None or raw.empty:
+                logger.warning(
+                    "[System] Market data fetch failed - check connectivity or IP block."
+                )
+                continue
+
+            for sym in batch:
+                try:
+                    if len(batch) == 1:
+                        df = raw.copy()
+                    else:
+                        df = raw[sym].copy()
+                    df = df.dropna(how="all")
+                    if df.empty or len(df) < 30:
+                        continue
+                    df.columns = [c.lower() for c in df.columns]
+                    result[sym] = df
+                except (KeyError, TypeError):
+                    pass
 
         logger.info("Fetched market data for %d / %d symbols", len(result), len(symbols))
         return result
