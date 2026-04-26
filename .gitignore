@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+env/
+
+# Environment files (contain secrets)
+.env
+
+# Alembic auto-generated migration files are committed; the database data is not
+*.db
+*.sqlite3
+
+# Logs
+logs/
+*.log
+
+# AI model files (mounted as a Docker volume; not tracked in git)
+models/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,26 @@
+# Web framework
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+
+# Database
+sqlalchemy==2.0.30
+alembic==1.13.1
+psycopg2-binary==2.9.9
+
+# AI / Reinforcement Learning
+stable-baselines3==2.3.2
+
+# Broker integration
+norenrestapi==1.0.28
+pyotp==2.9.0
+
+# Technical Analysis
+pandas_ta==0.3.14b
+TA-Lib==0.4.28
+
+# Market Data
+yfinance==0.2.40
+
+# Utilities
+python-dotenv==1.0.1
+httpx==0.27.0

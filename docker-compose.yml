@@ -1,0 +1,41 @@
+version: "3.9"
+
+services:
+  app:
+    build: .
+    container_name: aitrader_app
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://trader:trader_pass@db:5432/aitrader
+    ports:
+      - "8000:8000"
+    volumes:
+      - ai_models:/app/models
+      - ./logs:/app/logs
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:16-alpine
+    container_name: aitrader_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: trader
+      POSTGRES_PASSWORD: trader_pass
+      POSTGRES_DB: aitrader
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trader -d aitrader"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  ai_models:
+    driver: local
+  postgres_data:
+    driver: local
