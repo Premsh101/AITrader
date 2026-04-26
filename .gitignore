@@ -27,6 +27,11 @@ logs/
 # AI model files (mounted as a Docker volume; not tracked in git)
 models/
 
+# Node
+node_modules/
+dashboard/node_modules/
+dashboard/.next/
+
 # IDE
 .vscode/
 .idea/
