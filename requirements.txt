@@ -18,7 +18,7 @@ pyotp==2.9.0
 pandas_ta==0.4.67b0
 
 # Market Data
-yfinance==0.2.40
+yfinance>=0.2.40
 
 # Utilities
 python-dotenv==1.0.1

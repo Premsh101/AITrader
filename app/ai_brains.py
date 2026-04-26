@@ -39,12 +39,23 @@ ACTION_BUY_CLOSE = 1  # "BUY" for Hunter; "CLOSE" for Guardian
 def _load_sb3_model(path: str):
     """Load a Stable-Baselines3 PPO model from *path*.
 
+    ``custom_objects`` maps legacy schedule attribute names (``lr_schedule``,
+    ``clip_range``) to constant callables so that models saved with an older
+    version of stable-baselines3 (which used ``FloatSchedule``) load cleanly
+    under newer versions that no longer define that class.
+
     Returns the model object, or ``None`` if loading fails.
     """
     try:
         from stable_baselines3 import PPO  # type: ignore[import]
 
-        model = PPO.load(path)
+        # Provide constant-value callables for legacy schedule objects that
+        # may be stored inside old .zip saves (e.g. FloatSchedule).
+        custom_objects = {
+            "lr_schedule": lambda _: 3e-4,
+            "clip_range": lambda _: 0.2,
+        }
+        model = PPO.load(path, custom_objects=custom_objects)
         logger.info("Model loaded from %s", path)
         return model
     except FileNotFoundError:
