@@ -206,7 +206,7 @@ export default function Dashboard() {
       </main>
 
       <footer className="text-center text-[11px] text-slate-700 py-5 border-t border-slate-800/60">
-        AITrader &copy; {new Date().getFullYear()} — Auto-refreshes every 30 s
+        AITrader © {new Date().getFullYear()} — Auto-refreshes every 30 s
       </footer>
     </div>
   )
