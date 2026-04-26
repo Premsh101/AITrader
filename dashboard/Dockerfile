@@ -1,7 +1,11 @@
 FROM node:20-alpine AS deps
 WORKDIR /app
 COPY package.json ./
-RUN npm install --frozen-lockfile || npm install
+RUN npm cache clean --force && \
+    npm config set fetch-retry-mintimeout 20000 && \
+    npm config set fetch-retry-maxtimeout 120000 && \
+    npm config set fetch-timeout 300000 && \
+    npm install
 
 FROM node:20-alpine AS builder
 WORKDIR /app
