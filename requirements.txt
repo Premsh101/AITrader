@@ -11,11 +11,11 @@ psycopg2-binary==2.9.9
 stable-baselines3==2.3.2
 
 # Broker integration
-norenrestapi==1.0.28
+NorenRestApiPy==0.0.22
 pyotp==2.9.0
 
 # Technical Analysis
-pandas_ta==0.3.14b
+pandas_ta==0.4.67b0
 
 # Market Data
 yfinance==0.2.40
