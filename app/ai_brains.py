@@ -96,7 +96,8 @@ class HunterBrain:
             obs_2d = obs.reshape(1, -1)
             action, _ = self._model.predict(obs_2d, deterministic=True)
             return int(action)
-        # Fallback: use RSI heuristic (feature index 1 < 0.35 → oversold → BUY)
+        # Fallback heuristic: RSI < 35 (oversold territory) → BUY signal.
+        # 0.35 corresponds to RSI=35 (scaled to [0,1]) – a conservative oversold threshold.
         return ACTION_BUY_CLOSE if float(obs[1]) < 0.35 else ACTION_HOLD
 
 
@@ -131,7 +132,9 @@ class GuardianBrain:
             obs_2d = obs.reshape(1, -1)
             action, _ = self._model.predict(obs_2d, deterministic=True)
             return int(action)
-        # Fallback: close if RSI > 0.70 (overbought) or ret_1d < -0.02 (stop-loss)
+        # Fallback heuristic:
+        #   RSI > 70 (overbought, scaled: 0.70) → take profit.
+        #   1-day return < -2% → stop-loss trigger.
         rsi = float(obs[1])
         ret_1d = float(obs[10])
         return ACTION_BUY_CLOSE if (rsi > 0.70 or ret_1d < -0.02) else ACTION_HOLD

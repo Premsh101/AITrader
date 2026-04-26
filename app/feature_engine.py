@@ -75,25 +75,37 @@ def generate_features(df: pd.DataFrame) -> np.ndarray | None:
         macd_df = ta.macd(close, fast=12, slow=26, signal=9)
         if macd_df is None or macd_df.empty:
             return None
-        macd_col = [c for c in macd_df.columns if "MACD_" in c and "s" not in c.lower() and "h" not in c.lower()]
-        sig_col = [c for c in macd_df.columns if "MACDs" in c]
-        hist_col = [c for c in macd_df.columns if "MACDh" in c]
+        # pandas_ta MACD columns follow the pattern: MACD_12_26_9, MACDs_12_26_9, MACDh_12_26_9
+        macd_col = next(
+            (c for c in macd_df.columns if c.upper().startswith("MACD_")), None
+        )
+        sig_col = next(
+            (c for c in macd_df.columns if c.upper().startswith("MACDS_")), None
+        )
+        hist_col = next(
+            (c for c in macd_df.columns if c.upper().startswith("MACDH_")), None
+        )
         if not (macd_col and sig_col and hist_col):
             return None
-        macd_line = macd_df[macd_col[0]]
-        macd_sig = macd_df[sig_col[0]]
-        macd_hist = macd_df[hist_col[0]]
+        macd_line = macd_df[macd_col]
+        macd_sig = macd_df[sig_col]
+        macd_hist = macd_df[hist_col]
 
         # ── Bollinger Bands ───────────────────────────────────────────────
         bb = ta.bbands(close, length=20, std=2)
         if bb is None or bb.empty:
             return None
-        bb_upper_col = [c for c in bb.columns if "BBU" in c]
-        bb_lower_col = [c for c in bb.columns if "BBL" in c]
+        # pandas_ta BBands columns: BBL_20_2.0, BBM_20_2.0, BBU_20_2.0, BBB_20_2.0, BBP_20_2.0
+        bb_upper_col = next(
+            (c for c in bb.columns if c.upper().startswith("BBU_")), None
+        )
+        bb_lower_col = next(
+            (c for c in bb.columns if c.upper().startswith("BBL_")), None
+        )
         if not (bb_upper_col and bb_lower_col):
             return None
-        bb_upper = bb[bb_upper_col[0]]
-        bb_lower = bb[bb_lower_col[0]]
+        bb_upper = bb[bb_upper_col]
+        bb_lower = bb[bb_lower_col]
         bb_pct = (close - bb_lower) / (bb_upper - bb_lower + 1e-9)
 
         # ── Volume ratio ──────────────────────────────────────────────────

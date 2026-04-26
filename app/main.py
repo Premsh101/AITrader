@@ -154,7 +154,13 @@ def _run_trading_cycle() -> None:
                     if ltp is None:
                         # Use last close from market data as proxy
                         df = market_data.get(trade.symbol)
-                        ltp = float(df["close"].iloc[-1]) if df is not None else 0.0
+                        ltp = float(df["close"].iloc[-1]) if df is not None else None
+
+                    if ltp is None or ltp == 0.0:
+                        logger.warning(
+                            "Cannot close trade id=%s – price unavailable, skipping", trade.id
+                        )
+                        continue
 
                     trade.sell_price = Decimal(str(ltp))
                     if trade.buy_price is not None:
@@ -248,9 +254,17 @@ def health_check():
 @app.get("/stats", response_model=dict)
 def get_stats(db: Session = Depends(get_db)):
     """Return aggregate P&L statistics and active position count."""
-    today_start = datetime.now(timezone.utc).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
+    # Use IST (Asia/Kolkata) for NSE market day boundaries
+    try:
+        from zoneinfo import ZoneInfo
+        ist = ZoneInfo("Asia/Kolkata")
+    except Exception:
+        from datetime import timezone as _tz
+        ist = _tz.utc  # fallback if zoneinfo unavailable
+
+    now_ist = datetime.now(ist)
+    today_start_ist = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_start_utc = today_start_ist.astimezone(timezone.utc)
 
     closed_trades = db.query(Trade).filter(Trade.status == TradeStatus.CLOSED).all()
 
@@ -260,7 +274,7 @@ def get_stats(db: Session = Depends(get_db)):
 
     daily_closed = [
         t for t in closed_trades
-        if t.updated_at and t.updated_at >= today_start
+        if t.updated_at and t.updated_at >= today_start_utc
     ]
     daily_pnl = sum(float(t.pnl) for t in daily_closed if t.pnl is not None)
 
