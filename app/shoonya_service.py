@@ -6,12 +6,14 @@ The ShoonyaEngine class:
   - Reads the is_live_mode flag from the database before every order.
   - In Paper Mode: simulates the trade and records it without calling the broker API.
   - In Live Mode:  calls api.place_order and records the real order.
+  - get_market_data(): fetches OHLCV data via yfinance (Paper) or Shoonya quotes (Live).
 """
 
 import logging
 import os
 from datetime import datetime, timezone
 
+import pandas as pd
 from sqlalchemy.orm import Session
 
 from app.models import SystemConfig, Trade, TradeMode, TradeStatus
@@ -85,6 +87,68 @@ class ShoonyaEngine:
         except Exception as exc:  # noqa: BLE001
             logger.exception("Unexpected error during Shoonya login: %s", exc)
             return False
+
+    # ------------------------------------------------------------------
+    # Market data
+    # ------------------------------------------------------------------
+
+    def get_market_data(
+        self,
+        symbols: list[str],
+        period: str = "3mo",
+    ) -> dict[str, pd.DataFrame]:
+        """Fetch OHLCV history for a list of symbols.
+
+        In Paper mode (or when the Shoonya API is unavailable) data is fetched
+        from Yahoo Finance via *yfinance*.  Symbols must be in Yahoo Finance
+        format (e.g. ``"RELIANCE.NS"``).
+
+        Args:
+            symbols: List of ticker symbols (Yahoo Finance format).
+            period:  yfinance period string (default ``"3mo"``).
+
+        Returns:
+            Dict mapping symbol → OHLCV DataFrame (columns lower-cased).
+            Symbols that fail to download are omitted.
+        """
+        import yfinance as yf  # type: ignore[import]
+
+        result: dict[str, pd.DataFrame] = {}
+        batch_size = 100  # yfinance handles ~100 tickers efficiently per call
+
+        for i in range(0, len(symbols), batch_size):
+            batch = symbols[i : i + batch_size]
+            try:
+                raw = yf.download(
+                    tickers=batch,
+                    period=period,
+                    interval="1d",
+                    group_by="ticker",
+                    auto_adjust=True,
+                    progress=False,
+                    threads=True,
+                )
+                if raw.empty:
+                    continue
+
+                for sym in batch:
+                    try:
+                        if len(batch) == 1:
+                            df = raw.copy()
+                        else:
+                            df = raw[sym].copy()
+                        df = df.dropna(how="all")
+                        if df.empty or len(df) < 30:
+                            continue
+                        df.columns = [c.lower() for c in df.columns]
+                        result[sym] = df
+                    except (KeyError, TypeError):
+                        pass
+            except Exception:
+                logger.exception("Market data fetch failed for batch starting at index %d", i)
+
+        logger.info("Fetched market data for %d / %d symbols", len(result), len(symbols))
+        return result
 
     # ------------------------------------------------------------------
     # Price feed
