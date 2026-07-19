@@ -30,9 +30,26 @@ TRAIL_LOCK = float(os.environ.get("RISK_TRAIL_LOCK", "0.08"))
 DEATH_DRAWDOWN = float(os.environ.get("RISK_DEATH_DRAWDOWN", "0.25"))
 # Notional account size used for equity/death-protocol tracking (₹).
 BASE_CAPITAL = float(os.environ.get("BASE_CAPITAL", "50000"))
+# Estimated friction per side, basis points (brokerage+STT+slippage proxy).
+# Matches training/common.py COST_BPS so live P&L and backtests agree.
+TRADING_COST_BPS = float(os.environ.get("TRADING_COST_BPS", "25"))
+
+
+def round_trip_charges(buy_value: float, sell_value: float) -> float:
+    """Estimated total charges (₹) for a completed round trip."""
+    return (buy_value + sell_value) * TRADING_COST_BPS / 10_000.0
 VIX_SPIKE_PCT = float(os.environ.get("RISK_VIX_SPIKE_PCT", "0.15"))
 
 VIX_YAHOO = "^INDIAVIX"
+
+# Regime filter: new entries only while NIFTY is above its N-day average.
+REGIME_FILTER_ENABLED = os.environ.get("RISK_REGIME_FILTER", "1") == "1"
+REGIME_SMA_BARS = int(os.environ.get("RISK_REGIME_SMA_BARS", "200"))
+# Liquidity floor: minimum 20-day average turnover (₹) to enter a stock.
+MIN_TURNOVER = float(os.environ.get("RISK_MIN_TURNOVER", "50000000"))  # ₹5 crore
+# Volatility-scaled sizing: shrink the slot in wilder stocks.
+TARGET_ATR_PCT = float(os.environ.get("RISK_TARGET_ATR_PCT", "0.02"))
+MIN_SIZE_SCALE = float(os.environ.get("RISK_MIN_SIZE_SCALE", "0.25"))
 
 
 def overlay_exit_reason(
@@ -74,3 +91,58 @@ def vix_entries_blocked(vix_df: pd.DataFrame | None) -> bool:
 def death_threshold(peak_equity: float) -> float:
     """Equity below this value triggers the death protocol."""
     return peak_equity * (1.0 - DEATH_DRAWDOWN)
+
+
+def regime_allows_entries(nifty_df: pd.DataFrame | None) -> bool:
+    """Trend-following regime filter: allow new entries only while the NIFTY
+    trades above its REGIME_SMA_BARS-day average.
+
+    Bear markets are where small accounts die; staying out while the index is
+    below its long average is the oldest, best-evidenced protection there is.
+    Fails open when disabled or when there isn't enough history.
+    """
+    if not REGIME_FILTER_ENABLED:
+        return True
+    if nifty_df is None or len(nifty_df) < REGIME_SMA_BARS:
+        return True
+    try:
+        close = nifty_df["close"].astype(float)
+        return float(close.iloc[-1]) > float(close.rolling(REGIME_SMA_BARS).mean().iloc[-1])
+    except Exception:
+        return True
+
+
+def is_liquid(df: pd.DataFrame | None) -> bool:
+    """True when 20-day average turnover (close × volume) ≥ MIN_TURNOVER.
+
+    The cost model assumes ~25 bps of slippage — only realistic in liquid
+    names; illiquid small-caps can cost several times that.
+    """
+    if df is None or len(df) < 20:
+        return False
+    try:
+        turnover = (df["close"].astype(float) * df["volume"].astype(float)).tail(20).mean()
+        return float(turnover) >= MIN_TURNOVER
+    except Exception:
+        return False
+
+
+def vol_scaled_quantity(
+    reference_price: float,
+    atr_pct: float,
+    capital_per_slot: float,
+) -> int:
+    """Shares to buy with volatility-scaled slot capital.
+
+    The slot is scaled by TARGET_ATR_PCT / atr_pct (capped at 1×, floored at
+    MIN_SIZE_SCALE) so a stock moving 4%/day gets half the capital of one
+    moving 2%/day — equalising rupee risk per position.
+    """
+    if reference_price <= 0:
+        raise ValueError(f"reference_price must be positive, got {reference_price}")
+    scale = 1.0
+    if atr_pct and atr_pct > 0:
+        scale = min(1.0, max(MIN_SIZE_SCALE, TARGET_ATR_PCT / atr_pct))
+    import math
+
+    return max(1, math.floor(capital_per_slot * scale / reference_price))

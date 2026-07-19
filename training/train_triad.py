@@ -354,6 +354,14 @@ def main() -> None:
         "--smoke", action="store_true",
         help="Fast end-to-end check: 5 symbols, 5k timesteps per brain",
     )
+    parser.add_argument(
+        "--finetune", action="store_true",
+        help="Self-learning refresh: continue training each brain FROM its "
+        "existing zip in --out-dir on the latest data (reset_num_timesteps "
+        "stays False), instead of starting fresh. Combine with a smaller "
+        "--timesteps (e.g. 250000). The evaluation gate still decides "
+        "whether the refreshed models may be deployed.",
+    )
     args = parser.parse_args()
 
     symbols_subset = NSE_SYMBOLS[:5] if args.smoke else None
@@ -376,13 +384,17 @@ def main() -> None:
 
     for name in args.brains:
         env, filename = jobs[name]
+        out_path = os.path.join(out_dir, filename)
+        resume = args.resume_from if len(args.brains) == 1 else None
+        if args.finetune and os.path.exists(out_path):
+            resume = out_path
         train_one(
             name=name,
             env=env,
-            out_path=os.path.join(out_dir, filename),
+            out_path=out_path,
             timesteps=timesteps,
             checkpoint_dir=args.checkpoint_dir,
-            resume_from=args.resume_from if len(args.brains) == 1 else None,
+            resume_from=resume,
             seed=args.seed,
             device=args.device,
         )

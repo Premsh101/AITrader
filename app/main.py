@@ -40,7 +40,7 @@ import os
 import time
 from collections import deque
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -60,9 +60,9 @@ from app.feature_engine import (
     build_guardian_obs,
     generate_features,
 )
-from app.models import SystemConfig, Trade, TradeMode, TradeStatus
+from app.models import GhostTrade, SystemConfig, Trade, TradeMode, TradeStatus
 from app.security import allowed_origins, require_api_key
-from app.shoonya_service import ShoonyaEngine, position_size
+from app.shoonya_service import TRADE_CAPITAL_PER_SLOT, ShoonyaEngine
 from app.stock_list import NSE_SYMBOLS
 
 logging.basicConfig(
@@ -148,7 +148,8 @@ def _get_market_data_cached() -> dict[str, Any]:
         NIFTY_YAHOO,
         risk.VIX_YAHOO,
     ]
-    raw = shoonya.get_market_data(yahoo_tickers)
+    # 1y of history: features need ~60 bars, the regime filter needs 200.
+    raw = shoonya.get_market_data(yahoo_tickers, period="1y")
     data = {symbols.to_base(yahoo_sym): df for yahoo_sym, df in raw.items()}
 
     if data:
@@ -158,13 +159,61 @@ def _get_market_data_cached() -> dict[str, Any]:
 
 
 def _close_trade(db: Session, trade: Trade, exit_price: float, reason: str) -> None:
-    """Mark an open trade CLOSED at *exit_price*, recording why."""
+    """Mark an open trade CLOSED at *exit_price*, recording why.
+
+    ``pnl`` is stored NET of estimated round-trip charges (``charges``
+    column shows the deduction) so dashboard totals reflect keepable money.
+    """
     trade.sell_price = Decimal(str(exit_price))
     if trade.buy_price is not None:
-        trade.pnl = (Decimal(str(exit_price)) - trade.buy_price) * trade.quantity
+        gross = (Decimal(str(exit_price)) - trade.buy_price) * trade.quantity
+        charges = risk.round_trip_charges(
+            float(trade.buy_price) * trade.quantity, exit_price * trade.quantity
+        )
+        trade.charges = Decimal(str(round(charges, 4)))
+        trade.pnl = gross - trade.charges
     trade.status = TradeStatus.CLOSED
     trade.exit_reason = reason
     trade.updated_at = datetime.now(timezone.utc)
+    db.commit()
+
+
+def _record_ghosts(db: Session, syms: list[str], reason: str, market_data) -> None:
+    """Log rejected Hunter signals to the ghost ledger (dual-ledger design)."""
+    for sym in syms:
+        price = _last_close(market_data.get(sym))
+        if price is not None:
+            db.add(GhostTrade(symbol=sym, reference_price=Decimal(str(price)), reason=reason))
+    if syms:
+        db.commit()
+
+
+def _evaluate_ghosts(db: Session, market_data) -> None:
+    """Backfill 5-bar outcomes for ghost trades older than ~a trading week."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+    pending = (
+        db.query(GhostTrade)
+        .filter(GhostTrade.evaluated.is_(False), GhostTrade.created_at < cutoff)
+        .limit(200)
+        .all()
+    )
+    for ghost in pending:
+        df = market_data.get(ghost.symbol)
+        created = ghost.created_at
+        if created is not None and created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        if df is None or created is None:
+            continue
+        try:
+            idx = df.index.tz_localize("UTC") if df.index.tz is None else df.index
+            after = df.loc[idx > created, "close"].head(5)
+            if len(after) < 5:
+                continue
+            ref = float(ghost.reference_price)
+            ghost.max_gain_pct = Decimal(str(round(float(after.max()) / ref - 1.0, 4)))
+            ghost.evaluated = True
+        except Exception:
+            logger.debug("Ghost evaluation failed for %s", ghost.symbol, exc_info=True)
     db.commit()
 
 
@@ -306,6 +355,17 @@ def _run_trading_cycle() -> None:
         held = {t.symbol for t in open_trades}
         buy_signals = [s for s in buy_signals if s not in held]
 
+        # Liquidity floor: the 25 bps cost model is only realistic in names
+        # that actually trade; drop thin ones before the Executive sees them.
+        illiquid = [s for s in buy_signals if not risk.is_liquid(market_data.get(s))]
+        if illiquid:
+            _log_activity(
+                "Risk",
+                f"Dropped {len(illiquid)} illiquid signal(s): {', '.join(illiquid[:5])}",
+            )
+            buy_signals = [s for s in buy_signals if s not in illiquid]
+            _record_ghosts(db, illiquid, "illiquid", market_data)
+
         open_count = len(open_trades)
         available_slots = max(0, MAX_SLOTS - open_count)
         open_positions_frac = open_count / MAX_SLOTS
@@ -320,6 +380,12 @@ def _run_trading_cycle() -> None:
         selected = brains.executive.select_slots(
             buy_signals, executive_obs, available_slots
         )
+        rejected = [s for s in buy_signals if s not in selected]
+        _record_ghosts(
+            db, rejected,
+            "executive-skip" if available_slots > 0 else "no-slots",
+            market_data,
+        )
 
         is_live = config.is_live_mode
         mode = TradeMode.LIVE if is_live else TradeMode.PAPER
@@ -329,6 +395,18 @@ def _run_trading_cycle() -> None:
                 "Executive",
                 f"Skipping {len(selected)} entry(ies) – past 15:15 IST square-off cutoff",
             )
+            _record_ghosts(db, selected, "cutoff", market_data)
+            selected = []
+
+        # Regime filter: no new entries while NIFTY is below its 200-day
+        # average; open positions keep being managed.
+        if selected and not risk.regime_allows_entries(nifty_df):
+            _log_activity(
+                "Risk",
+                f"NIFTY below its {risk.REGIME_SMA_BARS}-day average – "
+                f"blocking {len(selected)} new entry(ies)",
+            )
+            _record_ghosts(db, selected, "regime-block", market_data)
             selected = []
 
         # VIX filter: a fear spike blocks new entries; exits keep running.
@@ -340,6 +418,7 @@ def _run_trading_cycle() -> None:
                 f"India VIX spiked more than {risk.VIX_SPIKE_PCT:.0%} today – "
                 f"blocking {len(selected)} new entry(ies)",
             )
+            _record_ghosts(db, selected, "vix-block", market_data)
             selected = []
 
         for sym in selected:
@@ -351,7 +430,11 @@ def _run_trading_cycle() -> None:
                     level=logging.ERROR,
                 )
                 continue
-            quantity = position_size(reference_price)
+            # Volatility-scaled sizing: feature 9 is ATR/close for the symbol.
+            atr_pct = float(symbol_features[sym][9]) if sym in symbol_features else 0.0
+            quantity = risk.vol_scaled_quantity(
+                reference_price, atr_pct, TRADE_CAPITAL_PER_SLOT
+            )
             _log_activity(
                 "Executive",
                 f"Placing {mode.value} BUY order → {sym} x{quantity} @ ~{reference_price:.2f}",
@@ -425,6 +508,9 @@ def _run_trading_cycle() -> None:
                     level=logging.ERROR,
                 )
                 logger.exception("Failed to close trade id=%s", trade.id)
+
+        # ── Ghost-ledger outcomes ─────────────────────────────────────────
+        _evaluate_ghosts(db, market_data)
 
         # ── Update last_sync_time ─────────────────────────────────────────
         if config:
@@ -580,6 +666,26 @@ def list_trades(
             "updated_at": t.updated_at.isoformat() if t.updated_at else None,
         }
         for t in trades
+    ]
+
+
+@app.get("/ghost-trades", response_model=list)
+def list_ghost_trades(limit: int = 50, db: Session = Depends(get_db)):
+    """Rejected signals and how they worked out (the dual-ledger view)."""
+    ghosts = (
+        db.query(GhostTrade).order_by(GhostTrade.id.desc()).limit(limit).all()
+    )
+    return [
+        {
+            "id": g.id,
+            "symbol": g.symbol,
+            "reason": g.reason,
+            "reference_price": str(g.reference_price),
+            "max_gain_pct": str(g.max_gain_pct) if g.max_gain_pct is not None else None,
+            "evaluated": g.evaluated,
+            "created_at": g.created_at.isoformat() if g.created_at else None,
+        }
+        for g in ghosts
     ]
 
 
