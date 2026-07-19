@@ -62,6 +62,8 @@ COPY ./models /app/models
 
 # Copy application source and supporting files
 COPY app ./app
+COPY training ./training
+COPY scripts ./scripts
 COPY alembic ./alembic
 COPY alembic.ini .
 COPY entrypoint.sh .

@@ -33,6 +33,7 @@ import sys
 
 import gymnasium as gym
 import numpy as np
+import pandas as pd
 from gymnasium import spaces
 
 # Allow `python training/train_triad.py` from the repo root (or Kaggle).
@@ -82,12 +83,46 @@ ACTION_HOLD = 0
 ACTION_ACT = 1  # BUY / CLOSE / APPROVE
 
 
+# Fraction of samples drawn from the system's own decision history
+# (real + ghost trades) when an experience file is supplied.
+EXPERIENCE_REPLAY_FRAC = 0.3
+
+
+def load_experience_points(
+    csv_path: str, data: dict[str, SymbolData], min_forward: int
+) -> list[tuple[str, int]]:
+    """Map an export of (symbol, date) decisions onto dataset indices."""
+    import csv
+
+    points: list[tuple[str, int]] = []
+    with open(csv_path) as fh:
+        for row in csv.DictReader(fh):
+            sd = data.get(row["symbol"])
+            if sd is None:
+                continue
+            hits = sd.dates.get_indexer([pd.Timestamp(row["date"])], method="nearest")
+            t = int(hits[0])
+            if 0 <= t < len(sd.close) - min_forward - 1:
+                points.append((row["symbol"], t))
+    logger.info("Experience replay: %d decision points mapped", len(points))
+    return points
+
+
 def _random_sample_point(
     rng: np.random.Generator,
     data: dict[str, SymbolData],
     min_forward: int,
+    experience: list[tuple[str, int]] | None = None,
 ) -> tuple[str, SymbolData, int]:
-    """Pick a random (symbol, t) leaving at least *min_forward* bars ahead."""
+    """Pick a random (symbol, t) leaving at least *min_forward* bars ahead.
+
+    With an experience list, EXPERIENCE_REPLAY_FRAC of samples revisit the
+    exact situations the live system faced — both trades it took and ghosts
+    it declined — so retraining concentrates on its own decisions.
+    """
+    if experience and rng.random() < EXPERIENCE_REPLAY_FRAC:
+        sym, t = experience[int(rng.integers(len(experience)))]
+        return sym, data[sym], t
     syms = list(data.keys())
     while True:
         sym = syms[rng.integers(len(syms))]
@@ -113,7 +148,8 @@ class HunterEnv(gym.Env):
 
     metadata = {"render_modes": []}
 
-    def __init__(self, data: dict[str, SymbolData], seed: int = 0) -> None:
+    def __init__(self, data: dict[str, SymbolData], seed: int = 0,
+                 experience: list | None = None) -> None:
         super().__init__()
         self.observation_space = spaces.Box(
             -np.inf, np.inf, shape=(MARKET_FEATURE_DIM,), dtype=np.float32
@@ -121,13 +157,14 @@ class HunterEnv(gym.Env):
         self.action_space = spaces.Discrete(2)
         self._data = data
         self._rng = np.random.default_rng(seed)
+        self._experience = experience
         self._steps = 0
         self._sd: SymbolData | None = None
         self._t = 0
 
     def _next_obs(self) -> np.ndarray:
         _, self._sd, self._t = _random_sample_point(
-            self._rng, self._data, FORWARD_BARS
+            self._rng, self._data, FORWARD_BARS, self._experience
         )
         return self._sd.features[self._t]
 
@@ -161,7 +198,8 @@ class GuardianEnv(gym.Env):
     TIME_PENALTY = -0.001
     DRAWDOWN_PENALTY_SCALE = 0.02
 
-    def __init__(self, data: dict[str, SymbolData], seed: int = 0) -> None:
+    def __init__(self, data: dict[str, SymbolData], seed: int = 0,
+                 experience: list | None = None) -> None:
         super().__init__()
         self.observation_space = spaces.Box(
             -np.inf, np.inf, shape=(GUARDIAN_DIM,), dtype=np.float32
@@ -169,6 +207,7 @@ class GuardianEnv(gym.Env):
         self.action_space = spaces.Discrete(2)
         self._data = data
         self._rng = np.random.default_rng(seed)
+        self._experience = experience
         self._sd: SymbolData | None = None
         self._entry_t = 0
         self._bars = 0
@@ -184,7 +223,7 @@ class GuardianEnv(gym.Env):
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
         _, self._sd, self._entry_t = _random_sample_point(
-            self._rng, self._data, MAX_TRADE_BARS + 1
+            self._rng, self._data, MAX_TRADE_BARS + 1, self._experience
         )
         self._bars = 0
         self._entry_price = float(self._sd.close[self._entry_t])
@@ -221,7 +260,8 @@ class ExecutiveEnv(gym.Env):
 
     metadata = {"render_modes": []}
 
-    def __init__(self, data: dict[str, SymbolData], ds: Dataset, seed: int = 0) -> None:
+    def __init__(self, data: dict[str, SymbolData], ds: Dataset, seed: int = 0,
+                 experience: list | None = None) -> None:
         super().__init__()
         self.observation_space = spaces.Box(
             -np.inf, np.inf, shape=(EXECUTIVE_DIM,), dtype=np.float32
@@ -230,13 +270,14 @@ class ExecutiveEnv(gym.Env):
         self._data = data
         self._ds = ds
         self._rng = np.random.default_rng(seed)
+        self._experience = experience
         self._steps = 0
         self._sd: SymbolData | None = None
         self._t = 0
 
     def _next_obs(self) -> np.ndarray:
         _, self._sd, self._t = _random_sample_point(
-            self._rng, self._data, FORWARD_BARS
+            self._rng, self._data, FORWARD_BARS, self._experience
         )
         # Portfolio fullness is randomised so the policy sees every regime;
         # the market context is the REAL ^NSEI 5-day return at that date.
@@ -344,6 +385,11 @@ def main() -> None:
         "--resume-from", default=None,
         help="Checkpoint zip to resume the (single) selected brain from",
     )
+    parser.add_argument(
+        "--experience", default=None,
+        help="CSV from scripts/export_experience.py; 30%% of training samples "
+        "then revisit the live system's own decisions (trades AND ghosts)",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--device", default="cpu", choices=["cpu", "cuda", "auto"],
@@ -376,10 +422,15 @@ def main() -> None:
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(args.checkpoint_dir, exist_ok=True)
 
+    exp_entry = exp_hold = None
+    if args.experience:
+        exp_entry = load_experience_points(args.experience, ds.train, FORWARD_BARS)
+        exp_hold = load_experience_points(args.experience, ds.train, MAX_TRADE_BARS + 1)
+
     jobs = {
-        "hunter": (HunterEnv(ds.train, seed=args.seed), HUNTER_FILE),
-        "guardian": (GuardianEnv(ds.train, seed=args.seed), GUARDIAN_FILE),
-        "executive": (ExecutiveEnv(ds.train, ds, seed=args.seed), EXECUTIVE_FILE),
+        "hunter": (HunterEnv(ds.train, seed=args.seed, experience=exp_entry), HUNTER_FILE),
+        "guardian": (GuardianEnv(ds.train, seed=args.seed, experience=exp_hold), GUARDIAN_FILE),
+        "executive": (ExecutiveEnv(ds.train, ds, seed=args.seed, experience=exp_entry), EXECUTIVE_FILE),
     }
 
     for name in args.brains:
