@@ -47,6 +47,13 @@ COST_BPS = 25.0
 COST_PER_SIDE = COST_BPS / 10_000.0
 ROUND_TRIP_COST = 2.0 * COST_PER_SIDE
 
+# TRAINING friction is deliberately doubled: a model that only learns edges
+# surviving 2x costs trades far more selectively.  EVALUATION always uses the
+# true ROUND_TRIP_COST.  (v1 failed the gate with 852 trades / -0.43% mean:
+# break-even gross, killed by friction.)
+TRAIN_COST_MULT = 2.0
+TRAIN_ROUND_TRIP_COST = ROUND_TRIP_COST * TRAIN_COST_MULT
+
 # Data window (yfinance period string, ≥ 5y required).
 DATA_PERIOD = "6y"
 
@@ -59,8 +66,8 @@ FORWARD_BARS = 5
 
 # Hold penalised as a missed opportunity only when the forward return
 # exceeded this threshold.
-MISSED_OPPORTUNITY_THRESHOLD = 0.01
-MISSED_OPPORTUNITY_PENALTY = -0.01
+MISSED_OPPORTUNITY_THRESHOLD = 0.03  # v2: only real moves count as missed
+MISSED_OPPORTUNITY_PENALTY = -0.005   # v2: patience is cheaper than churn
 
 # Guardian episode cap (bars) – must match the bars_in_trade scaling in
 # app.feature_engine.build_guardian_obs.
@@ -68,6 +75,9 @@ MAX_TRADE_BARS = 20
 
 # Portfolio slots – must match app.ai_brains.MAX_SLOTS.
 MAX_SLOTS = 5
+
+# Bars a just-closed symbol stays un-buyable (churn brake), serve + backtest.
+REENTRY_COOLDOWN_BARS = 5
 
 NIFTY_TICKER = "^NSEI"
 

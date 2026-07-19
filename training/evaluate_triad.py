@@ -37,6 +37,7 @@ if REPO_ROOT not in sys.path:
 
 from training.common import (  # noqa: E402
     MAX_SLOTS,
+    REENTRY_COOLDOWN_BARS,
     MAX_TRADE_BARS,
     ROUND_TRIP_COST,
     Dataset,
@@ -78,6 +79,7 @@ def run_backtest(ds: Dataset, brains) -> dict:
 
     cash = 1.0
     positions: dict[str, Position] = {}
+    cooldown: dict[str, int] = {}  # symbol -> bar index it was closed at
     trade_returns: list[float] = []
     equity_curve: list[float] = []
 
@@ -108,6 +110,7 @@ def run_backtest(ds: Dataset, brains) -> dict:
                 net = pnl_pct - ROUND_TRIP_COST
                 cash += pos.alloc * (1.0 + net)
                 trade_returns.append(net)
+                cooldown[sym] = i
                 del positions[sym]
 
         # ── Entry pass: Hunter → dedup → Executive ────────────────────────
@@ -117,7 +120,11 @@ def run_backtest(ds: Dataset, brains) -> dict:
             if today in date_idx[sym]
         }
         signals = brains.hunter.find_signals(todays_features)
-        signals = [s for s in signals if s not in positions]
+        signals = [
+            s for s in signals
+            if s not in positions
+            and date_idx[s][today] - cooldown.get(s, -10**9) > REENTRY_COOLDOWN_BARS
+        ]
 
         open_slots = MAX_SLOTS - len(positions)
         if signals and open_slots > 0:

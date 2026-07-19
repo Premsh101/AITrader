@@ -50,7 +50,7 @@ from training.common import (  # noqa: E402
     MAX_TRADE_BARS,
     MISSED_OPPORTUNITY_PENALTY,
     MISSED_OPPORTUNITY_THRESHOLD,
-    ROUND_TRIP_COST,
+    TRAIN_ROUND_TRIP_COST,
     Dataset,
     SymbolData,
     build_dataset,
@@ -176,7 +176,7 @@ class HunterEnv(gym.Env):
     def step(self, action):
         fwd = _forward_return(self._sd, self._t)
         if action == ACTION_ACT:
-            reward = fwd - ROUND_TRIP_COST
+            reward = fwd - TRAIN_ROUND_TRIP_COST
         else:
             reward = (
                 MISSED_OPPORTUNITY_PENALTY
@@ -233,7 +233,7 @@ class GuardianEnv(gym.Env):
     def _close_reward(self) -> float:
         t = self._entry_t + self._bars
         pnl_pct = self._sd.close[t] / self._entry_price - 1.0
-        return float(np.clip(pnl_pct - ROUND_TRIP_COST, -REWARD_CLIP, REWARD_CLIP))
+        return float(np.clip(pnl_pct - TRAIN_ROUND_TRIP_COST, -REWARD_CLIP, REWARD_CLIP))
 
     def step(self, action):
         if action == ACTION_ACT:  # CLOSE
@@ -293,7 +293,7 @@ class ExecutiveEnv(gym.Env):
     def step(self, action):
         fwd = _forward_return(self._sd, self._t)
         if action == ACTION_ACT:  # APPROVE
-            reward = fwd - ROUND_TRIP_COST
+            reward = fwd - TRAIN_ROUND_TRIP_COST
         else:  # SKIP
             reward = (
                 MISSED_OPPORTUNITY_PENALTY
