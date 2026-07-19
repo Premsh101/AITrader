@@ -286,9 +286,13 @@ def train_one(
 
     env = Monitor(env)
 
+    # Force CPU: PPO with MlpPolicy gains nothing from a GPU (SB3 itself warns
+    # about this), and Kaggle sometimes hands out GPUs (e.g. Tesla P100/sm_60)
+    # that current PyTorch wheels no longer ship kernels for, crashing with
+    # "no kernel image is available for execution on the device".
     if resume_from:
         logger.info("[%s] resuming from %s", name, resume_from)
-        model = PPO.load(resume_from, env=env)
+        model = PPO.load(resume_from, env=env, device="cpu")
     else:
         model = PPO(
             "MlpPolicy",
@@ -300,6 +304,7 @@ def train_one(
             ent_coef=0.01,
             seed=seed,
             verbose=1,
+            device="cpu",
         )
 
     callback = CheckpointCallback(

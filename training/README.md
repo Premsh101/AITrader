@@ -30,8 +30,10 @@ Key design points:
 
 ## Exact Kaggle steps
 
-1. Create a new Kaggle notebook (CPU is fine; GPU doesn't help MlpPolicy at
-   this size). In **Settings → Internet**, turn internet **ON**.
+1. Create a new Kaggle notebook. In **Settings → Internet**, turn internet
+   **ON**. Accelerator can stay **None (CPU)** — training is forced onto the
+   CPU regardless (a GPU doesn't help MlpPolicy, and some Kaggle GPUs like the
+   Tesla P100 aren't supported by current PyTorch wheels anyway).
 
 2. Cell 1 — clone the repo and install pinned deps (match `requirements.txt`):
 
@@ -41,12 +43,20 @@ Key design points:
    !pip install -q "stable-baselines3==2.8.0" "numpy>=2.0" "pandas_ta==0.4.67b0" "yfinance>=0.2.40"
    ```
 
+   pip may print "dependency resolver" complaints about Kaggle's own
+   pre-installed packages (bigframes, google-colab, dopamine-rl, …) — they
+   are unrelated to this project and safe to ignore.
+
 3. Cell 2 — smoke-check the pipeline end to end (~2 minutes):
 
    ```python
    !python training/train_triad.py --smoke
    !python training/evaluate_triad.py --smoke
    ```
+
+   Any ticker that fails to download (renamed/delisted on Yahoo) is skipped
+   with a logged warning and training continues with the rest — if you see
+   failures, update or remove those names in `app/stock_list.py`.
 
 4. Cell 3 — full training run:
 

@@ -53,7 +53,10 @@ def _load_sb3_model(path: str, expected_dim: int):
             logger.error("Model file not found at %s – brain NOT ready.", path)
             return None
 
-        model = PPO.load(path)
+        # device="cpu": inference is a single small MLP forward pass; this also
+        # keeps evaluation working on hosts whose GPU the installed PyTorch
+        # doesn't support (e.g. Kaggle's Tesla P100).
+        model = PPO.load(path, device="cpu")
         actual_shape = tuple(model.observation_space.shape)
         if actual_shape != (expected_dim,):
             logger.error(
