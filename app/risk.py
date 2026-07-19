@@ -30,6 +30,14 @@ TRAIL_LOCK = float(os.environ.get("RISK_TRAIL_LOCK", "0.08"))
 DEATH_DRAWDOWN = float(os.environ.get("RISK_DEATH_DRAWDOWN", "0.25"))
 # Notional account size used for equity/death-protocol tracking (₹).
 BASE_CAPITAL = float(os.environ.get("BASE_CAPITAL", "50000"))
+# Estimated friction per side, basis points (brokerage+STT+slippage proxy).
+# Matches training/common.py COST_BPS so live P&L and backtests agree.
+TRADING_COST_BPS = float(os.environ.get("TRADING_COST_BPS", "25"))
+
+
+def round_trip_charges(buy_value: float, sell_value: float) -> float:
+    """Estimated total charges (₹) for a completed round trip."""
+    return (buy_value + sell_value) * TRADING_COST_BPS / 10_000.0
 VIX_SPIKE_PCT = float(os.environ.get("RISK_VIX_SPIKE_PCT", "0.15"))
 
 VIX_YAHOO = "^INDIAVIX"
