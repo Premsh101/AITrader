@@ -62,7 +62,7 @@ from app.feature_engine import (
 )
 from app.models import SystemConfig, Trade, TradeMode, TradeStatus
 from app.security import allowed_origins, require_api_key
-from app.shoonya_service import ShoonyaEngine, position_size
+from app.shoonya_service import TRADE_CAPITAL_PER_SLOT, ShoonyaEngine
 from app.stock_list import NSE_SYMBOLS
 
 logging.basicConfig(
@@ -148,7 +148,8 @@ def _get_market_data_cached() -> dict[str, Any]:
         NIFTY_YAHOO,
         risk.VIX_YAHOO,
     ]
-    raw = shoonya.get_market_data(yahoo_tickers)
+    # 1y of history: features need ~60 bars, the regime filter needs 200.
+    raw = shoonya.get_market_data(yahoo_tickers, period="1y")
     data = {symbols.to_base(yahoo_sym): df for yahoo_sym, df in raw.items()}
 
     if data:
@@ -306,6 +307,16 @@ def _run_trading_cycle() -> None:
         held = {t.symbol for t in open_trades}
         buy_signals = [s for s in buy_signals if s not in held]
 
+        # Liquidity floor: the 25 bps cost model is only realistic in names
+        # that actually trade; drop thin ones before the Executive sees them.
+        illiquid = [s for s in buy_signals if not risk.is_liquid(market_data.get(s))]
+        if illiquid:
+            _log_activity(
+                "Risk",
+                f"Dropped {len(illiquid)} illiquid signal(s): {', '.join(illiquid[:5])}",
+            )
+            buy_signals = [s for s in buy_signals if s not in illiquid]
+
         open_count = len(open_trades)
         available_slots = max(0, MAX_SLOTS - open_count)
         open_positions_frac = open_count / MAX_SLOTS
@@ -331,6 +342,16 @@ def _run_trading_cycle() -> None:
             )
             selected = []
 
+        # Regime filter: no new entries while NIFTY is below its 200-day
+        # average; open positions keep being managed.
+        if selected and not risk.regime_allows_entries(nifty_df):
+            _log_activity(
+                "Risk",
+                f"NIFTY below its {risk.REGIME_SMA_BARS}-day average – "
+                f"blocking {len(selected)} new entry(ies)",
+            )
+            selected = []
+
         # VIX filter: a fear spike blocks new entries; exits keep running.
         if selected and risk.vix_entries_blocked(
             market_data.get(symbols.to_base(risk.VIX_YAHOO))
@@ -351,7 +372,11 @@ def _run_trading_cycle() -> None:
                     level=logging.ERROR,
                 )
                 continue
-            quantity = position_size(reference_price)
+            # Volatility-scaled sizing: feature 9 is ATR/close for the symbol.
+            atr_pct = float(symbol_features[sym][9]) if sym in symbol_features else 0.0
+            quantity = risk.vol_scaled_quantity(
+                reference_price, atr_pct, TRADE_CAPITAL_PER_SLOT
+            )
             _log_activity(
                 "Executive",
                 f"Placing {mode.value} BUY order → {sym} x{quantity} @ ~{reference_price:.2f}",
