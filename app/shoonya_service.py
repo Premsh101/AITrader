@@ -4,23 +4,41 @@ shoonya_service.py – Shoonya (Finvasia) broker integration with Paper/Live tog
 The ShoonyaEngine class:
   - Authenticates via TOTP using the NorenRestApi SDK.
   - Reads the is_live_mode flag from the database before every order.
-  - In Paper Mode: simulates the trade and records it without calling the broker API.
-  - In Live Mode:  calls api.place_order and records the real order.
-  - get_market_data(): fetches OHLCV data via yfinance (Paper) or Shoonya quotes (Live).
+  - In Paper Mode: simulates the trade WITHOUT any broker call; the fill price
+    is the caller-supplied ``reference_price`` (a 0.0-price trade is impossible).
+  - In Live Mode: places a real order, storing the broker order id.
+  - get_market_data(): fetches OHLCV data via yfinance.
+
+Symbol convention: all public methods take the BASE NSE symbol (e.g.
+``"RELIANCE"``).  Conversion to Yahoo/Shoonya formats happens internally via
+:mod:`app.symbols`.
 """
 
 import logging
+import math
 import os
 import time
-from datetime import datetime, timezone
+from typing import Optional
 
 import pandas as pd
 import requests
 from sqlalchemy.orm import Session
 
+from app import symbols
 from app.models import SystemConfig, Trade, TradeMode, TradeStatus
 
 logger = logging.getLogger(__name__)
+
+# Rupees of capital allocated per portfolio slot; sizes orders as
+# floor(capital / price) with a minimum of one share.
+TRADE_CAPITAL_PER_SLOT = float(os.environ.get("TRADE_CAPITAL_PER_SLOT", "10000"))
+
+
+def position_size(reference_price: float) -> int:
+    """Number of shares to buy for one slot at *reference_price*."""
+    if reference_price <= 0:
+        raise ValueError(f"reference_price must be positive, got {reference_price}")
+    return max(1, math.floor(TRADE_CAPITAL_PER_SLOT / reference_price))
 
 
 class ShoonyaEngine:
@@ -113,14 +131,13 @@ class ShoonyaEngine:
 
     def get_market_data(
         self,
-        symbols: list[str],
+        yahoo_symbols: list[str],
         period: str = "3mo",
     ) -> dict[str, pd.DataFrame]:
-        """Fetch OHLCV history for a list of symbols.
+        """Fetch OHLCV history for a list of Yahoo Finance tickers.
 
-        In Paper mode (or when the Shoonya API is unavailable) data is fetched
-        from Yahoo Finance via *yfinance*.  Symbols must be in Yahoo Finance
-        format (e.g. ``"RELIANCE.NS"``).
+        Data is fetched from Yahoo Finance via *yfinance*; features are daily
+        indicators, so daily bars suffice for both Paper and Live modes.
 
         A custom requests Session with a browser User-Agent is injected so that
         Yahoo Finance does not block VPS/server traffic.  Failed batches are
@@ -128,12 +145,14 @@ class ShoonyaEngine:
         delays before being skipped.
 
         Args:
-            symbols: List of ticker symbols (Yahoo Finance format).
-            period:  yfinance period string (default ``"3mo"``).
+            yahoo_symbols: Tickers in Yahoo Finance format (``"RELIANCE.NS"``,
+                           index tickers like ``"^NSEI"`` pass through as-is).
+            period:        yfinance period string (default ``"3mo"``).
 
         Returns:
-            Dict mapping symbol → OHLCV DataFrame (columns lower-cased).
-            Symbols that fail to download are omitted.
+            Dict mapping the *input* Yahoo ticker → OHLCV DataFrame (columns
+            lower-cased).  Symbols that fail to download are omitted.  Callers
+            re-key to base symbols at the edge via :func:`app.symbols.to_base`.
         """
         import yfinance as yf  # type: ignore[import]
 
@@ -141,8 +160,8 @@ class ShoonyaEngine:
         batch_size = 100  # yfinance handles ~100 tickers efficiently per call
         session = self._yf_session()
 
-        for i in range(0, len(symbols), batch_size):
-            batch = symbols[i : i + batch_size]
+        for i in range(0, len(yahoo_symbols), batch_size):
+            batch = yahoo_symbols[i : i + batch_size]
             raw = None
 
             for attempt in range(1, self._YF_MAX_RETRIES + 1):
@@ -191,44 +210,42 @@ class ShoonyaEngine:
                 except (KeyError, TypeError):
                     pass
 
-        logger.info("Fetched market data for %d / %d symbols", len(result), len(symbols))
+        logger.info(
+            "Fetched market data for %d / %d symbols", len(result), len(yahoo_symbols)
+        )
         return result
 
     # ------------------------------------------------------------------
     # Price feed
     # ------------------------------------------------------------------
 
-    def get_live_price(self, symbol: str) -> float | None:
-        """Fetch the Last Traded Price (LTP) for *symbol* from Shoonya.
+    def get_live_price(self, symbol_base: str) -> float | None:
+        """Fetch the Last Traded Price (LTP) for a base symbol from Shoonya.
 
-        Returns the LTP as a float, or None if the price cannot be obtained.
-        The API must be logged in before calling this method.
+        The Shoonya-format symbol is built internally, so the caller never
+        deals with broker formats.  Returns the LTP as a float, or ``None``
+        if the price cannot be obtained (including when login fails).
 
         Args:
-            symbol: NSE trading symbol, e.g. ``"NSE:RELIANCE-EQ"``.
+            symbol_base: Base NSE symbol, e.g. ``"RELIANCE"``.
         """
         if self._api is None:
             logger.warning("get_live_price called before login; attempting login.")
             if not self.login():
                 return None
 
-        if ":" not in symbol:
-            raise ValueError(
-                f"Invalid symbol format '{symbol}'. Expected 'EXCHANGE:SYMBOL', "
-                "e.g. 'NSE:RELIANCE-EQ'."
-            )
+        exchange, trading_symbol = symbols.to_shoonya(symbol_base)
 
         try:
-            exchange, trading_symbol = symbol.split(":", 1)
             response = self._api.get_quotes(exchange=exchange, token=trading_symbol)
             if response and response.get("stat") == "Ok":
                 ltp = float(response["lp"])
-                logger.debug("LTP for %s: %s", symbol, ltp)
+                logger.debug("LTP for %s: %s", symbol_base, ltp)
                 return ltp
-            logger.warning("Could not fetch LTP for %s: %s", symbol, response)
+            logger.warning("Could not fetch LTP for %s: %s", symbol_base, response)
             return None
         except Exception as exc:  # noqa: BLE001
-            logger.exception("Error fetching LTP for %s: %s", symbol, exc)
+            logger.exception("Error fetching LTP for %s: %s", symbol_base, exc)
             return None
 
     # ------------------------------------------------------------------
@@ -237,21 +254,26 @@ class ShoonyaEngine:
 
     def place_logic_order(
         self,
-        symbol: str,
+        symbol_base: str,
         quantity: int,
         side: str,
         db: Session,
+        reference_price: Optional[float] = None,
     ) -> Trade:
         """Place a buy or sell order, respecting the Paper/Live toggle.
 
         The method reads ``SystemConfig.is_live_mode`` from the database at
-        call time so that the toggle takes effect without restarting the service.
+        call time so that the toggle takes effect without restarting the
+        service.
 
         Args:
-            symbol:   NSE trading symbol, e.g. ``"NSE:RELIANCE-EQ"``.
-            quantity: Number of shares/lots to trade.
-            side:     ``"BUY"`` or ``"SELL"`` (case-insensitive).
-            db:       Active SQLAlchemy session (injected via FastAPI dependency).
+            symbol_base:     Base NSE symbol, e.g. ``"RELIANCE"``.
+            quantity:        Number of shares to trade.
+            side:            ``"BUY"`` or ``"SELL"`` (case-insensitive).
+            db:              Active SQLAlchemy session.
+            reference_price: Last known price (e.g. last close from market
+                             data).  REQUIRED in paper mode; used as the
+                             fallback fill price in live mode.
 
         Returns:
             The persisted :class:`Trade` ORM object.
@@ -259,19 +281,22 @@ class ShoonyaEngine:
         side = side.upper()
         if side not in ("BUY", "SELL"):
             raise ValueError(f"Invalid side '{side}'. Must be 'BUY' or 'SELL'.")
+        if quantity <= 0:
+            raise ValueError(f"Invalid quantity {quantity}. Must be positive.")
+
+        symbol_base = symbols.to_base(symbol_base)
 
         # Read live-mode flag; default to Paper if no config row exists yet
         config: SystemConfig | None = db.query(SystemConfig).first()
         is_live = config.is_live_mode if config else False
 
-        ltp = self.get_live_price(symbol)
-
         if is_live:
-            trade = self._place_live_order(symbol, quantity, side, ltp, db)
-        else:
-            trade = self._place_paper_order(symbol, quantity, side, ltp, db)
-
-        return trade
+            return self._place_live_order(
+                symbol_base, quantity, side, reference_price, db
+            )
+        return self._place_paper_order(
+            symbol_base, quantity, side, reference_price, db
+        )
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -279,22 +304,33 @@ class ShoonyaEngine:
 
     def _place_paper_order(
         self,
-        symbol: str,
+        symbol_base: str,
         quantity: int,
         side: str,
-        ltp: float | None,
+        reference_price: Optional[float],
         db: Session,
     ) -> Trade:
-        """Simulate a trade without calling the broker API."""
-        price = ltp or 0.0
+        """Simulate a trade – never touches the broker API or live price feed.
+
+        Raises:
+            ValueError: if *reference_price* is missing or non-positive; a
+                        paper trade recorded at price 0.0 must be impossible.
+        """
+        if reference_price is None or reference_price <= 0:
+            raise ValueError(
+                f"Paper order for {symbol_base} requires a positive "
+                f"reference_price (got {reference_price})."
+            )
+
         logger.info(
-            "[PAPER] Simulated %s %d x %s @ %.4f", side, quantity, symbol, price
+            "[PAPER] Simulated %s %d x %s @ %.4f",
+            side, quantity, symbol_base, reference_price,
         )
 
         trade = Trade(
-            symbol=symbol,
-            buy_price=price if side == "BUY" else None,
-            sell_price=price if side == "SELL" else None,
+            symbol=symbol_base,
+            buy_price=reference_price if side == "BUY" else None,
+            sell_price=reference_price if side == "SELL" else None,
             quantity=quantity,
             status=TradeStatus.OPEN,
             mode=TradeMode.PAPER,
@@ -306,10 +342,10 @@ class ShoonyaEngine:
 
     def _place_live_order(
         self,
-        symbol: str,
+        symbol_base: str,
         quantity: int,
         side: str,
-        ltp: float | None,
+        reference_price: Optional[float],
         db: Session,
     ) -> Trade:
         """Execute a real order via the Shoonya API."""
@@ -319,18 +355,12 @@ class ShoonyaEngine:
                 raise RuntimeError("Could not authenticate with Shoonya API.")
 
         try:
-            if ":" not in symbol:
-                raise ValueError(
-                    f"Invalid symbol format '{symbol}'. Expected 'EXCHANGE:SYMBOL', "
-                    "e.g. 'NSE:RELIANCE-EQ'."
-                )
-
-            exchange, trading_symbol = symbol.split(":", 1)
+            exchange, trading_symbol = symbols.to_shoonya(symbol_base)
             transaction_type = "B" if side == "BUY" else "S"
 
             response = self._api.place_order(
                 buy_or_sell=transaction_type,
-                product_type="I",      # Intraday
+                product_type="I",      # Intraday – broker squares off ~15:20 IST
                 exchange=exchange,
                 tradingsymbol=trading_symbol,
                 quantity=quantity,
@@ -345,19 +375,27 @@ class ShoonyaEngine:
             if not (response and response.get("stat") == "Ok"):
                 raise RuntimeError(f"Shoonya order placement failed: {response}")
 
+            broker_order_id = response.get("norenordno")
+
             logger.info(
-                "[LIVE] Order placed – %s %d x %s. Response: %s",
-                side, quantity, symbol, response,
+                "[LIVE] Order placed – %s %d x %s (order id %s). Response: %s",
+                side, quantity, symbol_base, broker_order_id, response,
             )
 
-            price = ltp or 0.0
+            # Best-effort fill price: LTP immediately after placement, falling
+            # back to the caller's reference price.  The true fill price would
+            # require polling the order-book/trade-book API for this order id;
+            # this is a known approximation.
+            fill_price = self.get_live_price(symbol_base) or reference_price or 0.0
+
             trade = Trade(
-                symbol=symbol,
-                buy_price=price if side == "BUY" else None,
-                sell_price=price if side == "SELL" else None,
+                symbol=symbol_base,
+                buy_price=fill_price if side == "BUY" else None,
+                sell_price=fill_price if side == "SELL" else None,
                 quantity=quantity,
                 status=TradeStatus.OPEN,
                 mode=TradeMode.LIVE,
+                broker_order_id=broker_order_id,
             )
             db.add(trade)
             db.commit()
@@ -366,5 +404,5 @@ class ShoonyaEngine:
 
         except Exception as exc:
             db.rollback()
-            logger.exception("Error placing live order for %s: %s", symbol, exc)
+            logger.exception("Error placing live order for %s: %s", symbol_base, exc)
             raise

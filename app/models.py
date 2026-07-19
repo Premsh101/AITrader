@@ -42,6 +42,7 @@ class Trade(Base):
         Enum(TradeMode), nullable=False, default=TradeMode.PAPER
     )
     pnl: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
+    broker_order_id: Mapped[str | None] = mapped_column(String(50), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
