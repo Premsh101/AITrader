@@ -43,6 +43,11 @@ class Trade(Base):
     )
     pnl: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
     broker_order_id: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    # Highest close observed since entry; drives the profit-ladder overlay.
+    peak_price: Mapped[float | None] = mapped_column(Numeric(18, 4), nullable=True)
+    # Why the position was closed: "guardian", "stop-loss", "time-exit",
+    # "profit-trail", "breakeven-stop", "death-protocol", "manual".
+    exit_reason: Mapped[str | None] = mapped_column(String(30), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -74,6 +79,10 @@ class SystemConfig(Base):
     last_sync_time: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # High-water mark of tracked equity; feeds the 25%-drawdown death rule.
+    peak_equity: Mapped[float | None] = mapped_column(Numeric(18, 2), nullable=True)
+    # Set by the death protocol; while True the trading loop refuses to run.
+    is_halted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
     def __repr__(self) -> str:
         return (
