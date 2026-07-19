@@ -11,6 +11,14 @@ interface HeaderProps {
 export default function Header({ isLive, onModeChange }: HeaderProps) {
   const handleToggle = async () => {
     const newMode = isLive ? 'PAPER' : 'LIVE'
+    if (
+      newMode === 'LIVE' &&
+      !window.confirm(
+        'Switch to LIVE mode? The system will place REAL orders with REAL money.'
+      )
+    ) {
+      return
+    }
     try {
       await toggleMode(newMode)
       onModeChange(!isLive)

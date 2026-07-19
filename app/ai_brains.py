@@ -2,67 +2,73 @@
 ai_brains.py – Stable-Baselines3 model wrappers for the AITrader system.
 
 Three AI brains:
-  • HunterBrain    – scans feature vectors and emits BUY signals.
-  • GuardianBrain  – watches open-trade feature vectors and emits CLOSE signals.
-  • ExecutiveBrain – selects at most MAX_SLOTS signals from the Hunter's output.
+  • HunterBrain    – scans 15-dim market feature vectors and emits BUY signals.
+  • GuardianBrain  – watches 17-dim open-trade observations and emits CLOSE signals.
+  • ExecutiveBrain – approves/ranks Hunter candidates from 17-dim observations.
 
-All brains load their models lazily and degrade gracefully when the .zip files
-are absent (useful for local development / CI without model artefacts).
+There are NO heuristic fallbacks.  If a model file is missing, fails to load,
+or its observation space does not match the expected dimension, the brain is
+simply not ready (``BrainManager.all_ready`` is False) and the trading loop
+must skip the cycle.  Trading on anything other than the trained models is
+never allowed — that silent degradation is what previously masked a total
+observation-shape mismatch.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from typing import TYPE_CHECKING
 
 import numpy as np
 
-if TYPE_CHECKING:
-    pass
+from app.feature_engine import EXECUTIVE_DIM, GUARDIAN_DIM, MARKET_FEATURE_DIM
 
 logger = logging.getLogger(__name__)
 
 MODELS_DIR: str = os.environ.get("MODELS_DIR", "/app/models")
 MAX_SLOTS: int = 5
 
-# Action constants (must match the training environment)
+# Action constants (must match the training environments in training/)
 ACTION_HOLD = 0
-ACTION_BUY_CLOSE = 1  # "BUY" for Hunter; "CLOSE" for Guardian
+ACTION_BUY_CLOSE = 1  # "BUY" for Hunter; "CLOSE" for Guardian; "APPROVE" for Executive
+
+# Executive approval threshold: candidates whose approve-probability is at or
+# below this are rejected regardless of ranking.
+EXECUTIVE_APPROVE_THRESHOLD = 0.5
 
 
-# ---------------------------------------------------------------------------
-# Base helper
-# ---------------------------------------------------------------------------
+def _load_sb3_model(path: str, expected_dim: int):
+    """Load a Stable-Baselines3 PPO model and validate its observation space.
 
-
-def _load_sb3_model(path: str):
-    """Load a Stable-Baselines3 PPO model from *path*.
-
-    ``custom_objects`` maps legacy schedule attribute names (``lr_schedule``,
-    ``clip_range``) to constant callables so that models saved with an older
-    version of stable-baselines3 (which used ``FloatSchedule``) load cleanly
-    under newer versions that no longer define that class.
-
-    Returns the model object, or ``None`` if loading fails.
+    Returns the model object, or ``None`` if the file is missing, loading
+    fails, or ``observation_space.shape`` does not equal ``(expected_dim,)``.
+    The shape assertion makes the original silent-mismatch failure impossible
+    to reintroduce: a model trained against different features refuses to
+    load rather than predicting garbage.
     """
     try:
         from stable_baselines3 import PPO  # type: ignore[import]
 
-        # Provide constant-value callables for legacy schedule objects that
-        # may be stored inside old .zip saves (e.g. FloatSchedule).
-        custom_objects = {
-            "lr_schedule": lambda _: 3e-4,
-            "clip_range": lambda _: 0.2,
-        }
-        model = PPO.load(path, custom_objects=custom_objects)
-        logger.info("Model loaded from %s", path)
+        if not os.path.exists(path):
+            logger.error("Model file not found at %s – brain NOT ready.", path)
+            return None
+
+        model = PPO.load(path)
+        actual_shape = tuple(model.observation_space.shape)
+        if actual_shape != (expected_dim,):
+            logger.error(
+                "Model %s observation shape %s does not match expected (%d,) "
+                "– brain NOT ready. Retrain with training/train_triad.py.",
+                path,
+                actual_shape,
+                expected_dim,
+            )
+            return None
+
+        logger.info("Model loaded from %s (obs dim %d)", path, expected_dim)
         return model
-    except FileNotFoundError:
-        logger.warning("Model file not found at %s – brain will use random fallback.", path)
-        return None
     except Exception:
-        logger.exception("Failed to load model from %s", path)
+        logger.exception("Failed to load model from %s – brain NOT ready.", path)
         return None
 
 
@@ -75,41 +81,41 @@ class HunterBrain:
     """Scans market feature vectors and identifies potential BUY candidates."""
 
     MODEL_FILE = "hunter_apex_1500_brain.zip"
+    OBS_DIM = MARKET_FEATURE_DIM
 
     def __init__(self) -> None:
         self._model = None
 
+    @property
+    def ready(self) -> bool:
+        return self._model is not None
+
     def load(self) -> None:
         path = os.path.join(MODELS_DIR, self.MODEL_FILE)
-        self._model = _load_sb3_model(path)
+        self._model = _load_sb3_model(path, self.OBS_DIM)
 
     def find_signals(self, symbol_features: dict[str, np.ndarray]) -> list[str]:
-        """Return a list of symbol strings that the Hunter flags as BUY.
+        """Return a list of symbols the Hunter flags as BUY.
 
         Args:
-            symbol_features: Mapping of ``{symbol: feature_vector}``.
+            symbol_features: Mapping of ``{symbol: 15-dim feature vector}``.
 
         Returns:
             List of symbols with a positive BUY signal.
         """
+        if not self.ready:
+            raise RuntimeError("Hunter model not loaded")
+
         signals: list[str] = []
         for symbol, obs in symbol_features.items():
             try:
-                action = self._predict(obs)
-                if action == ACTION_BUY_CLOSE:
+                obs_2d = np.asarray(obs, dtype=np.float32).reshape(1, -1)
+                action, _ = self._model.predict(obs_2d, deterministic=True)
+                if int(np.asarray(action).reshape(-1)[0]) == ACTION_BUY_CLOSE:
                     signals.append(symbol)
             except Exception:
-                logger.debug("Hunter inference failed for %s", symbol, exc_info=True)
+                logger.warning("Hunter inference failed for %s", symbol, exc_info=True)
         return signals
-
-    def _predict(self, obs: np.ndarray) -> int:
-        if self._model is not None:
-            obs_2d = obs.reshape(1, -1)
-            action, _ = self._model.predict(obs_2d, deterministic=True)
-            return int(action)
-        # Fallback heuristic: RSI < 35 (oversold territory) → BUY signal.
-        # 0.35 corresponds to RSI=35 (scaled to [0,1]) – a conservative oversold threshold.
-        return ACTION_BUY_CLOSE if float(obs[1]) < 0.35 else ACTION_HOLD
 
 
 # ---------------------------------------------------------------------------
@@ -118,37 +124,39 @@ class HunterBrain:
 
 
 class GuardianBrain:
-    """Monitors open-trade feature vectors and decides when to CLOSE positions."""
+    """Monitors open-trade observations and decides when to CLOSE positions."""
 
     MODEL_FILE = "guardian_apex_1500_brain.zip"
+    OBS_DIM = GUARDIAN_DIM
 
     def __init__(self) -> None:
         self._model = None
 
+    @property
+    def ready(self) -> bool:
+        return self._model is not None
+
     def load(self) -> None:
         path = os.path.join(MODELS_DIR, self.MODEL_FILE)
-        self._model = _load_sb3_model(path)
+        self._model = _load_sb3_model(path, self.OBS_DIM)
 
-    def should_close(self, obs: np.ndarray) -> bool:
-        """Return ``True`` if the Guardian recommends closing this position."""
+    def should_close(self, obs: np.ndarray, symbol: str = "?") -> bool:
+        """Return ``True`` if the Guardian recommends closing this position.
+
+        Args:
+            obs:    17-dim observation from ``build_guardian_obs``.
+            symbol: Symbol for log context.
+        """
+        if not self.ready:
+            raise RuntimeError("Guardian model not loaded")
+
         try:
-            action = self._predict(obs)
-            return action == ACTION_BUY_CLOSE
-        except Exception:
-            logger.debug("Guardian inference failed", exc_info=True)
-            return False
-
-    def _predict(self, obs: np.ndarray) -> int:
-        if self._model is not None:
-            obs_2d = obs.reshape(1, -1)
+            obs_2d = np.asarray(obs, dtype=np.float32).reshape(1, -1)
             action, _ = self._model.predict(obs_2d, deterministic=True)
-            return int(action)
-        # Fallback heuristic:
-        #   RSI > 70 (overbought, scaled: 0.70) → take profit.
-        #   1-day return < -2% → stop-loss trigger.
-        rsi = float(obs[1])
-        ret_1d = float(obs[10])
-        return ACTION_BUY_CLOSE if (rsi > 0.70 or ret_1d < -0.02) else ACTION_HOLD
+            return int(np.asarray(action).reshape(-1)[0]) == ACTION_BUY_CLOSE
+        except Exception:
+            logger.warning("Guardian inference failed for %s", symbol, exc_info=True)
+            return False
 
 
 # ---------------------------------------------------------------------------
@@ -157,59 +165,79 @@ class GuardianBrain:
 
 
 class ExecutiveBrain:
-    """Selects up to MAX_SLOTS signals from the Hunter's BUY candidates."""
+    """Approves and ranks Hunter candidates by approve probability."""
 
     MODEL_FILE = "executive_apex_manager.zip"
+    OBS_DIM = EXECUTIVE_DIM
 
     def __init__(self) -> None:
         self._model = None
 
+    @property
+    def ready(self) -> bool:
+        return self._model is not None
+
     def load(self) -> None:
         path = os.path.join(MODELS_DIR, self.MODEL_FILE)
-        self._model = _load_sb3_model(path)
+        self._model = _load_sb3_model(path, self.OBS_DIM)
+
+    def approve_probability(self, obs: np.ndarray) -> float:
+        """Return the policy's probability of the APPROVE action for *obs*.
+
+        Ranking by probability (rather than the argmax action) breaks the ties
+        a Discrete action value would produce, giving a real priority ordering.
+        """
+        if not self.ready:
+            raise RuntimeError("Executive model not loaded")
+
+        import torch
+
+        obs_2d = np.asarray(obs, dtype=np.float32).reshape(1, -1)
+        with torch.no_grad():
+            obs_t, _ = self._model.policy.obs_to_tensor(obs_2d)
+            dist = self._model.policy.get_distribution(obs_t)
+            prob = float(dist.distribution.probs[0, ACTION_BUY_CLOSE].item())
+        return prob
 
     def select_slots(
         self,
         signals: list[str],
-        symbol_features: dict[str, np.ndarray],
+        observations: dict[str, np.ndarray],
         open_slots: int,
     ) -> list[str]:
         """Choose at most *open_slots* symbols from *signals* to act on.
 
         Args:
-            signals:         Symbols flagged by the Hunter.
-            symbol_features: Feature vectors keyed by symbol.
-            open_slots:      Number of free portfolio slots remaining.
+            signals:      Symbols flagged by the Hunter (already deduplicated
+                          against currently held positions by the caller).
+            observations: 17-dim Executive observations keyed by symbol
+                          (from ``build_executive_obs``).
+            open_slots:   Number of free portfolio slots remaining.
 
         Returns:
-            Ordered list of symbols the Executive approves for entry.
+            Symbols approved for entry, ordered by descending approve
+            probability.  Only candidates with probability strictly above
+            ``EXECUTIVE_APPROVE_THRESHOLD`` are approved at all.
         """
         if not signals or open_slots <= 0:
             return []
+        if not self.ready:
+            raise RuntimeError("Executive model not loaded")
 
         limit = min(open_slots, MAX_SLOTS)
 
-        if self._model is None:
-            # Fallback: rank by lowest RSI (most oversold first)
-            ranked = sorted(
-                signals,
-                key=lambda s: float(symbol_features.get(s, np.zeros(15))[1]),
-            )
-            return ranked[:limit]
-
-        # Score each candidate using the Executive model
         scores: list[tuple[float, str]] = []
         for sym in signals:
-            obs = symbol_features.get(sym)
+            obs = observations.get(sym)
             if obs is None:
                 continue
             try:
-                obs_2d = obs.reshape(1, -1)
-                action, _ = self._model.predict(obs_2d, deterministic=True)
-                # Higher action value → higher priority
-                scores.append((float(action), sym))
+                prob = self.approve_probability(obs)
             except Exception:
-                scores.append((0.0, sym))
+                logger.warning("Executive inference failed for %s", sym, exc_info=True)
+                continue
+            if prob > EXECUTIVE_APPROVE_THRESHOLD:
+                scores.append((prob, sym))
 
         scores.sort(reverse=True)
         return [sym for _, sym in scores[:limit]]
@@ -228,9 +256,23 @@ class BrainManager:
         self.guardian = GuardianBrain()
         self.executive = ExecutiveBrain()
 
+    @property
+    def all_ready(self) -> bool:
+        """True only when every brain has a validated model loaded."""
+        return self.hunter.ready and self.guardian.ready and self.executive.ready
+
     def load_all(self) -> None:
-        """Load all three brain models from disk."""
+        """Load all three brain models from disk and report readiness."""
         self.hunter.load()
         self.guardian.load()
         self.executive.load()
-        logger.info("All AI brains loaded.")
+        if self.all_ready:
+            logger.info("All AI brains loaded and validated.")
+        else:
+            logger.error(
+                "AI brains NOT ready (hunter=%s guardian=%s executive=%s) – "
+                "trading is disabled until valid models are present.",
+                self.hunter.ready,
+                self.guardian.ready,
+                self.executive.ready,
+            )
