@@ -52,7 +52,7 @@ from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app import risk, symbols
+from app import auto_trainer, risk, symbols
 from app.ai_brains import MAX_SLOTS, BrainManager
 from app.database import get_db, SessionLocal
 from app.feature_engine import (
@@ -535,6 +535,11 @@ async def lifespan(application: FastAPI):
     brains.load_all()
 
     task = asyncio.create_task(_trading_loop())
+    models_dir = os.environ.get("MODELS_DIR", "/app/models")
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    trainer_task = asyncio.create_task(
+        auto_trainer.weekend_loop(models_dir, repo_root, IST, _log_activity, brains)
+    )
     logger.info(
         "Background trading loop started (interval=%ds, fetch TTL=%ds)",
         TRADING_LOOP_INTERVAL,
@@ -545,10 +550,12 @@ async def lifespan(application: FastAPI):
 
     # ── Shutdown ──────────────────────────────────────────────────────────
     task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
+    trainer_task.cancel()
+    for t in (task, trainer_task):
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
     logger.info("Background trading loop stopped")
 
 
