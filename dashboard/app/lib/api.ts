@@ -5,6 +5,10 @@
 const API_URL =
   process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000'
 
+// Shared secret for mutating endpoints; must match AITRADER_API_KEY on the
+// backend. Embedded at build time, so keep the dashboard itself private.
+const API_KEY = process.env.NEXT_PUBLIC_API_KEY ?? ''
+
 export interface Stats {
   total_pnl: number
   daily_pnl: number
@@ -57,8 +61,26 @@ export const fetchActivity = (limit = 50) =>
   apiFetch<ActivityEntry[]>(`/activity?limit=${limit}`)
 export const fetchConfig = () => apiFetch<Config>('/config')
 
+/** Headers for mutating requests (API-key protected on the backend). */
+const mutatingHeaders = { 'X-API-Key': API_KEY }
+
 export const toggleMode = (mode: 'PAPER' | 'LIVE') =>
   apiFetch<{ mode: string; is_live_mode: boolean }>('/toggle-mode', {
     method: 'POST',
-    body: JSON.stringify({ mode }),
+    headers: mutatingHeaders,
+    // confirm is required by the backend when switching to LIVE; the UI has
+    // already asked the user before this call is made.
+    body: JSON.stringify({ mode, confirm: true }),
+  })
+
+export const placeOrder = (order: {
+  symbol: string
+  quantity: number
+  side: 'BUY' | 'SELL'
+  reference_price?: number
+}) =>
+  apiFetch<Record<string, unknown>>('/order', {
+    method: 'POST',
+    headers: mutatingHeaders,
+    body: JSON.stringify(order),
   })

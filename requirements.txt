@@ -8,7 +8,10 @@ alembic==1.13.1
 psycopg2-binary==2.9.9
 
 # AI / Reinforcement Learning
-stable-baselines3==2.3.2
+# SB3 2.8.0 matches the version used to train the models (NumPy 2 compatible);
+# it pulls compatible gymnasium/torch versions itself.
+stable-baselines3==2.8.0
+numpy>=2.0
 
 # Broker integration
 NorenRestApiPy==0.0.22

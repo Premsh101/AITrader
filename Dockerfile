@@ -7,8 +7,14 @@ WORKDIR /dashboard
 COPY dashboard/package.json dashboard/package-lock.json* ./
 RUN npm install --no-audit
 
-# Copy the rest of the dashboard source and build the Next.js app
+# Copy the rest of the dashboard source and build the Next.js app.
+# NEXT_PUBLIC_* values are embedded into the client bundle at build time,
+# so they must be provided as build args (see docker-compose.yml).
 COPY dashboard/ .
+ARG NEXT_PUBLIC_API_URL=http://localhost:8005
+ARG NEXT_PUBLIC_API_KEY=
+ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
+ENV NEXT_PUBLIC_API_KEY=$NEXT_PUBLIC_API_KEY
 ENV NEXT_TELEMETRY_DISABLED=1
 RUN npm run build
 
