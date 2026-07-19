@@ -79,6 +79,11 @@ MAX_SLOTS = 5
 # Bars a just-closed symbol stays un-buyable (churn brake), serve + backtest.
 REENTRY_COOLDOWN_BARS = 5
 
+# Hard stop-loss fraction (matches app/risk.py RISK_STOP_LOSS_PCT).  Training
+# rewards cap downside here, teaching the TRUE risk profile: max loss ~5%,
+# target +10%-style moves -> ~2:1 reward-to-risk per trade.
+TRAIN_STOP_LOSS = 0.05
+
 NIFTY_TICKER = "^NSEI"
 
 # Exact filenames the app loads (app/ai_brains.py).
