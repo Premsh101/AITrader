@@ -279,6 +279,7 @@ def train_one(
     checkpoint_dir: str,
     resume_from: str | None = None,
     seed: int = 0,
+    device: str = "cpu",
 ) -> None:
     from stable_baselines3 import PPO
     from stable_baselines3.common.callbacks import CheckpointCallback
@@ -286,13 +287,15 @@ def train_one(
 
     env = Monitor(env)
 
-    # Force CPU: PPO with MlpPolicy gains nothing from a GPU (SB3 itself warns
-    # about this), and Kaggle sometimes hands out GPUs (e.g. Tesla P100/sm_60)
-    # that current PyTorch wheels no longer ship kernels for, crashing with
-    # "no kernel image is available for execution on the device".
+    # Default is CPU: PPO with MlpPolicy gains nothing from a GPU (SB3 itself
+    # warns about this — the policy net is tiny and the bottleneck is the env),
+    # and Kaggle sometimes hands out GPUs (e.g. Tesla P100/sm_60) that current
+    # PyTorch wheels no longer ship kernels for, crashing with "no kernel image
+    # is available for execution on the device".  --device cuda is accepted for
+    # supported GPUs (e.g. T4) but is not expected to be faster.
     if resume_from:
         logger.info("[%s] resuming from %s", name, resume_from)
-        model = PPO.load(resume_from, env=env, device="cpu")
+        model = PPO.load(resume_from, env=env, device=device)
     else:
         model = PPO(
             "MlpPolicy",
@@ -304,7 +307,7 @@ def train_one(
             ent_coef=0.01,
             seed=seed,
             verbose=1,
-            device="cpu",
+            device=device,
         )
 
     callback = CheckpointCallback(
@@ -343,6 +346,11 @@ def main() -> None:
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
+        "--device", default="cpu", choices=["cpu", "cuda", "auto"],
+        help="Torch device for PPO (default cpu; cuda works on supported GPUs "
+        "like the T4 but is typically no faster for MlpPolicy)",
+    )
+    parser.add_argument(
         "--smoke", action="store_true",
         help="Fast end-to-end check: 5 symbols, 5k timesteps per brain",
     )
@@ -376,6 +384,7 @@ def main() -> None:
             checkpoint_dir=args.checkpoint_dir,
             resume_from=args.resume_from if len(args.brains) == 1 else None,
             seed=args.seed,
+            device=args.device,
         )
 
     logger.info(
