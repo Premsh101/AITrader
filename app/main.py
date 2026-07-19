@@ -443,9 +443,15 @@ def get_stats(db: Session = Depends(get_db)):
     winning_trades = [t for t in closed_trades if t.pnl is not None and float(t.pnl) > 0]
     win_rate = (len(winning_trades) / len(closed_trades) * 100) if closed_trades else 0.0
 
+    def _as_utc(dt: datetime | None) -> datetime | None:
+        # SQLite returns naive datetimes even for DateTime(timezone=True).
+        if dt is not None and dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt
+
     daily_closed = [
         t for t in closed_trades
-        if t.updated_at and t.updated_at >= today_start_utc
+        if t.updated_at and _as_utc(t.updated_at) >= today_start_utc
     ]
     daily_pnl = sum(float(t.pnl) for t in daily_closed if t.pnl is not None)
 
