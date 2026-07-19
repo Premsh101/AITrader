@@ -353,7 +353,19 @@ def _run_trading_cycle() -> None:
 
         # ── 4. Executive selects slots (excluding held symbols) ───────────
         held = {t.symbol for t in open_trades}
-        buy_signals = [s for s in buy_signals if s not in held]
+        # Re-entry cooldown (churn brake): symbols closed in the last ~5
+        # trading days are un-buyable, mirroring the backtest.
+        cooldown_cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+        recently_closed = {
+            row[0]
+            for row in db.query(Trade.symbol)
+            .filter(Trade.status == TradeStatus.CLOSED,
+                    Trade.updated_at >= cooldown_cutoff)
+            .all()
+        }
+        buy_signals = [
+            s for s in buy_signals if s not in held and s not in recently_closed
+        ]
 
         # Liquidity floor: the 25 bps cost model is only realistic in names
         # that actually trade; drop thin ones before the Executive sees them.
