@@ -51,6 +51,7 @@ from training.common import (  # noqa: E402
     MISSED_OPPORTUNITY_PENALTY,
     MISSED_OPPORTUNITY_THRESHOLD,
     TRAIN_ROUND_TRIP_COST,
+    TRAIN_STOP_LOSS,
     Dataset,
     SymbolData,
     build_dataset,
@@ -176,7 +177,9 @@ class HunterEnv(gym.Env):
     def step(self, action):
         fwd = _forward_return(self._sd, self._t)
         if action == ACTION_ACT:
-            reward = fwd - TRAIN_ROUND_TRIP_COST
+            # The live stop-loss caps real losses at ~5%; cap the training
+            # penalty identically so the learned risk:reward matches reality.
+            reward = max(fwd, -TRAIN_STOP_LOSS) - TRAIN_ROUND_TRIP_COST
         else:
             reward = (
                 MISSED_OPPORTUNITY_PENALTY
@@ -246,6 +249,10 @@ class GuardianEnv(gym.Env):
         self._peak = max(self._peak, price)
         drawdown = (self._peak - price) / self._peak
 
+        # Hard stop-loss: forced exit exactly like the live risk overlay.
+        if price / self._entry_price - 1.0 <= -TRAIN_STOP_LOSS:
+            return self._obs(), self._close_reward(), True, False, {}
+
         if self._bars >= MAX_TRADE_BARS:
             # Forced exit at the bar cap (mirrors serving-side reality).
             return self._obs(), self._close_reward(), True, False, {}
@@ -293,7 +300,7 @@ class ExecutiveEnv(gym.Env):
     def step(self, action):
         fwd = _forward_return(self._sd, self._t)
         if action == ACTION_ACT:  # APPROVE
-            reward = fwd - TRAIN_ROUND_TRIP_COST
+            reward = max(fwd, -TRAIN_STOP_LOSS) - TRAIN_ROUND_TRIP_COST
         else:  # SKIP
             reward = (
                 MISSED_OPPORTUNITY_PENALTY
@@ -321,12 +328,18 @@ def train_one(
     resume_from: str | None = None,
     seed: int = 0,
     device: str = "cpu",
+    n_envs: int = 1,
 ) -> None:
     from stable_baselines3 import PPO
     from stable_baselines3.common.callbacks import CheckpointCallback
     from stable_baselines3.common.monitor import Monitor
 
-    env = Monitor(env)
+    if n_envs > 1:
+        from stable_baselines3.common.env_util import make_vec_env
+        env_fns = env  # a factory when n_envs > 1
+        env = make_vec_env(env_fns, n_envs=n_envs)
+    else:
+        env = Monitor(env if not callable(env) else env())
 
     # Default is CPU: PPO with MlpPolicy gains nothing from a GPU (SB3 itself
     # warns about this — the policy net is tiny and the bottleneck is the env),
@@ -390,9 +403,19 @@ def main() -> None:
         help="CSV from scripts/export_experience.py; 30%% of training samples "
         "then revisit the live system's own decisions (trades AND ghosts)",
     )
+    parser.add_argument(
+        "--seeds", type=int, default=1,
+        help="Train N independent variants per brain (different seeds) - "
+        "multiple strategies; pick the winner with training/tournament.py",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
-        "--device", default="cpu", choices=["cpu", "cuda", "auto"],
+        "--n-envs", type=int, default=4,
+        help="Parallel rollout environments (CPU cores); pairs with "
+        "--device auto to keep CPU and GPU both busy (default 4)",
+    )
+    parser.add_argument(
+        "--device", default="auto", choices=["cpu", "cuda", "auto"],
         help="Torch device for PPO (default cpu; cuda works on supported GPUs "
         "like the T4 but is typically no faster for MlpPolicy)",
     )
@@ -427,28 +450,33 @@ def main() -> None:
         exp_entry = load_experience_points(args.experience, ds.train, FORWARD_BARS)
         exp_hold = load_experience_points(args.experience, ds.train, MAX_TRADE_BARS + 1)
 
-    jobs = {
-        "hunter": (HunterEnv(ds.train, seed=args.seed, experience=exp_entry), HUNTER_FILE),
-        "guardian": (GuardianEnv(ds.train, seed=args.seed, experience=exp_hold), GUARDIAN_FILE),
-        "executive": (ExecutiveEnv(ds.train, ds, seed=args.seed, experience=exp_entry), EXECUTIVE_FILE),
-    }
+    def jobs_for(seed):
+        return {
+            "hunter": (lambda: HunterEnv(ds.train, seed=seed, experience=exp_entry), HUNTER_FILE),
+            "guardian": (lambda: GuardianEnv(ds.train, seed=seed, experience=exp_hold), GUARDIAN_FILE),
+            "executive": (lambda: ExecutiveEnv(ds.train, ds, seed=seed, experience=exp_entry), EXECUTIVE_FILE),
+        }
 
-    for name in args.brains:
-        env, filename = jobs[name]
-        out_path = os.path.join(out_dir, filename)
-        resume = args.resume_from if len(args.brains) == 1 else None
-        if args.finetune and os.path.exists(out_path):
-            resume = out_path
-        train_one(
-            name=name,
-            env=env,
-            out_path=out_path,
-            timesteps=timesteps,
-            checkpoint_dir=args.checkpoint_dir,
-            resume_from=resume,
-            seed=args.seed,
-            device=args.device,
-        )
+    for variant in range(args.seeds):
+        seed = args.seed + variant
+        suffix = f"_s{variant}" if args.seeds > 1 else ""
+        for name in args.brains:
+            env_fn, filename = jobs_for(seed)[name]
+            out_path = os.path.join(out_dir, filename.replace(".zip", f"{suffix}.zip"))
+            resume = args.resume_from if len(args.brains) == 1 else None
+            if args.finetune and os.path.exists(out_path):
+                resume = out_path
+            train_one(
+                name=f"{name}{suffix}",
+                env=env_fn,
+                out_path=out_path,
+                timesteps=timesteps,
+                checkpoint_dir=args.checkpoint_dir,
+                resume_from=resume,
+                seed=seed,
+                device=args.device,
+                n_envs=args.n_envs,
+            )
 
     logger.info(
         "Training complete. Run `python training/evaluate_triad.py` and only "
