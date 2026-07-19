@@ -41,3 +41,8 @@ dashboard/.next/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local tooling artefacts
+.venv/
+dashboard/next-env.d.ts
+dashboard/tsconfig.tsbuildinfo
