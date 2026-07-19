@@ -47,6 +47,7 @@ from training.common import (  # noqa: E402
 )
 
 from app.feature_engine import build_executive_obs, build_guardian_obs  # noqa: E402
+from app.risk import overlay_exit_reason, regime_allows_entries  # noqa: E402
 from app.stock_list import NSE_SYMBOLS  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -105,9 +106,15 @@ def run_backtest(ds: Dataset, brains) -> dict:
             pos.peak = max(pos.peak, price)
 
             pnl_pct = price / pos.entry_price - 1.0
-            obs = build_guardian_obs(sd.features[i], pnl_pct, pos.bars)
-            if pos.bars >= MAX_TRADE_BARS or brains.guardian.should_close(obs, sym):
-                net = pnl_pct - ROUND_TRIP_COST
+            peak_pnl = pos.peak / pos.entry_price - 1.0
+            # Deterministic risk overlays run BEFORE the Guardian, exactly as
+            # in the live loop (app/main.py) - the backtest grades the SYSTEM.
+            close_now = overlay_exit_reason(pnl_pct, peak_pnl, pos.bars) is not None
+            if not close_now:
+                obs = build_guardian_obs(sd.features[i], pnl_pct, pos.bars)
+                close_now = brains.guardian.should_close(obs, sym)
+            if close_now:
+                net = max(pnl_pct, -0.05) - ROUND_TRIP_COST
                 cash += pos.alloc * (1.0 + net)
                 trade_returns.append(net)
                 cooldown[sym] = i
@@ -119,6 +126,12 @@ def run_backtest(ds: Dataset, brains) -> dict:
             for sym in ds.val
             if today in date_idx[sym]
         }
+        nifty_hist = None
+        if ds.nifty_close is not None:
+            nifty_hist = ds.nifty_close[ds.nifty_close.index <= today].to_frame("close")
+        if not regime_allows_entries(nifty_hist):
+            equity_curve.append(mark_equity(today))
+            continue
         signals = brains.hunter.find_signals(todays_features)
         signals = [
             s for s in signals

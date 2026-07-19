@@ -34,7 +34,9 @@ ACTION_BUY_CLOSE = 1  # "BUY" for Hunter; "CLOSE" for Guardian; "APPROVE" for Ex
 
 # Executive approval threshold: candidates whose approve-probability is at or
 # below this are rejected regardless of ranking.
-EXECUTIVE_APPROVE_THRESHOLD = 0.5
+EXECUTIVE_APPROVE_THRESHOLD = float(
+    os.environ.get("EXECUTIVE_APPROVE_THRESHOLD", "0.5")
+)
 
 
 def _load_sb3_model(path: str, expected_dim: int):
