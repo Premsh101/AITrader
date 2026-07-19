@@ -1,11 +1,13 @@
 """
 feature_engine.py – Technical-indicator feature generation for AITrader.
 
-Given a single-symbol OHLCV DataFrame (columns: open, high, low, close, volume),
-``generate_features`` returns a 1-D numpy float32 array that can be fed directly
-into a Stable-Baselines3 model.
+This module is the SINGLE source of truth for feature definitions.  The
+training package (``training/train_triad.py``) imports
+:func:`compute_feature_frame` so that training and serving share one
+implementation — any drift between the two is exactly the class of bug that
+made the original models unusable.
 
-Feature vector layout (15 values):
+Market feature vector layout (15 values, ``MARKET_FEATURE_DIM``):
   0  close_ratio        – close / 20-period SMA (measures price relative to trend)
   1  rsi                – RSI(14), scaled to [0, 1]
   2  macd               – MACD line, normalised by close
@@ -21,6 +23,16 @@ Feature vector layout (15 values):
   12 rsi_delta          – RSI change over last 3 bars
   13 stoch_k            – Stochastic %K, scaled to [0, 1]
   14 stoch_d            – Stochastic %D, scaled to [0, 1]
+
+Guardian observation (17 values, ``GUARDIAN_DIM``):
+  0–14  market features above
+  15    unrealized P&L %, clipped to [-0.5, 0.5]
+  16    bars in trade, capped at 20 and scaled to [0, 1]
+
+Executive observation (17 values, ``EXECUTIVE_DIM``):
+  0–14  market features above
+  15    open positions fraction (open_count / MAX_SLOTS)
+  16    NIFTY (^NSEI) 5-day return, clipped
 """
 
 from __future__ import annotations
@@ -32,20 +44,50 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-FEATURE_DIM = 15
+MARKET_FEATURE_DIM = 15
+GUARDIAN_DIM = 17
+EXECUTIVE_DIM = 17
+
+# Backwards-compatible alias (pre-refactor name).
+FEATURE_DIM = MARKET_FEATURE_DIM
+
+FEATURE_COLUMNS: list[str] = [
+    "close_ratio",
+    "rsi",
+    "macd",
+    "macd_signal",
+    "macd_hist",
+    "bb_pct",
+    "ema9_ratio",
+    "ema21_ratio",
+    "vol_ratio",
+    "atr_norm",
+    "ret_1d",
+    "ret_5d",
+    "rsi_delta",
+    "stoch_k",
+    "stoch_d",
+]
+
+# Number of leading bars whose indicator values are dominated by rolling-window
+# warm-up (longest window is EMA(50)/SMA(20)/RSI(14) chains → ~50 bars).
+WARMUP_BARS = 50
 
 
-def generate_features(df: pd.DataFrame) -> np.ndarray | None:
-    """Compute the 15-feature observation vector from an OHLCV DataFrame.
+def compute_feature_frame(df: pd.DataFrame) -> pd.DataFrame | None:
+    """Compute the full history of all 15 market features for one symbol.
 
     Args:
-        df: DataFrame with columns [open, high, low, close, volume] sorted by
-            date ascending.  At least 60 rows are recommended so that all
-            indicators have enough history.
+        df: OHLCV DataFrame with columns [open, high, low, close, volume]
+            (case-insensitive) sorted by date ascending.  At least 30 rows
+            are required; ≥60 recommended so all indicators have history.
 
     Returns:
-        A numpy float32 array of shape ``(FEATURE_DIM,)``, or ``None`` if the
-        DataFrame is too short or contains too many NaN values.
+        DataFrame indexed like *df* with the 15 ``FEATURE_COLUMNS``, NaN/Inf
+        replaced and values clipped to [-5, 5]; or ``None`` if the input is
+        too short or indicator computation fails.  The first ``WARMUP_BARS``
+        rows contain zero-filled warm-up values — training code should skip
+        them.
     """
     if df is None or len(df) < 30:
         return None
@@ -57,10 +99,10 @@ def generate_features(df: pd.DataFrame) -> np.ndarray | None:
     try:
         import pandas_ta as ta  # type: ignore[import]
 
-        close = df["close"]
-        high = df["high"]
-        low = df["low"]
-        volume = df["volume"]
+        close = df["close"].astype(float)
+        high = df["high"].astype(float)
+        low = df["low"].astype(float)
+        volume = df["volume"].astype(float)
 
         # ── Moving averages ───────────────────────────────────────────────
         sma20 = close.rolling(20).mean()
@@ -70,6 +112,8 @@ def generate_features(df: pd.DataFrame) -> np.ndarray | None:
 
         # ── RSI ───────────────────────────────────────────────────────────
         rsi_series = ta.rsi(close, length=14)
+        if rsi_series is None:
+            rsi_series = pd.Series(np.nan, index=close.index)
 
         # ── MACD ──────────────────────────────────────────────────────────
         macd_df = ta.macd(close, fast=12, slow=26, signal=9)
@@ -136,41 +180,108 @@ def generate_features(df: pd.DataFrame) -> np.ndarray | None:
             stoch_k = stoch[k_col[0]] if k_col else pd.Series(50.0, index=close.index)
             stoch_d = stoch[d_col[0]] if d_col else pd.Series(50.0, index=close.index)
 
-        # ── Assemble last row ─────────────────────────────────────────────
-        last = -1  # index of the most recent bar
-        last_close = float(close.iloc[last])
-        if last_close == 0:
-            return None
+        frame = pd.DataFrame(
+            {
+                "close_ratio": close / (sma20 + 1e-9),
+                "rsi": rsi_series / 100.0,
+                "macd": macd_line / (close + 1e-9),
+                "macd_signal": macd_sig / (close + 1e-9),
+                "macd_hist": macd_hist / (close + 1e-9),
+                "bb_pct": bb_pct,
+                "ema9_ratio": ema9 / (ema21 + 1e-9),
+                "ema21_ratio": ema21 / (ema50 + 1e-9),
+                "vol_ratio": vol_ratio,
+                "atr_norm": atr_norm,
+                "ret_1d": ret_1d,
+                "ret_5d": ret_5d,
+                "rsi_delta": rsi_delta / 100.0,
+                "stoch_k": stoch_k / 100.0,
+                "stoch_d": stoch_d / 100.0,
+            },
+            index=df.index,
+        )[FEATURE_COLUMNS]
 
-        features = np.array(
-            [
-                float(close.iloc[last]) / (float(sma20.iloc[last]) + 1e-9),  # 0
-                float(rsi_series.iloc[last]) / 100.0,                         # 1
-                float(macd_line.iloc[last]) / last_close,                     # 2
-                float(macd_sig.iloc[last]) / last_close,                      # 3
-                float(macd_hist.iloc[last]) / last_close,                     # 4
-                float(bb_pct.iloc[last]),                                      # 5
-                float(ema9.iloc[last]) / (float(ema21.iloc[last]) + 1e-9),    # 6
-                float(ema21.iloc[last]) / (float(ema50.iloc[last]) + 1e-9),   # 7
-                float(vol_ratio.iloc[last]),                                   # 8
-                float(atr_norm.iloc[last]),                                    # 9
-                float(ret_1d.iloc[last]),                                      # 10
-                float(ret_5d.iloc[last]),                                      # 11
-                float(rsi_delta.iloc[last]) / 100.0,                          # 12
-                float(stoch_k.iloc[last]) / 100.0,                            # 13
-                float(stoch_d.iloc[last]) / 100.0,                            # 14
-            ],
-            dtype=np.float32,
-        )
+        # Replace any remaining NaN / Inf, then clip to reasonable bounds to
+        # avoid exploding inputs (same handling the models were trained with).
+        frame = frame.replace([np.inf, -np.inf], [1.0, -1.0]).fillna(0.0)
+        frame = frame.clip(-5.0, 5.0).astype(np.float32)
 
-        # Replace any remaining NaN / Inf with 0
-        features = np.nan_to_num(features, nan=0.0, posinf=1.0, neginf=-1.0)
-
-        # Clip to reasonable bounds to avoid exploding inputs
-        features = np.clip(features, -5.0, 5.0)
-
-        return features
+        return frame
 
     except Exception:
-        logger.exception("Feature generation failed for provided DataFrame")
+        logger.exception("Feature computation failed for provided DataFrame")
         return None
+
+
+def generate_features(df: pd.DataFrame) -> np.ndarray | None:
+    """Compute the 15-feature observation vector for the most recent bar.
+
+    Thin wrapper over :func:`compute_feature_frame` that returns the last row
+    as a ``float32`` array of shape ``(MARKET_FEATURE_DIM,)``.
+
+    Args:
+        df: OHLCV DataFrame with columns [open, high, low, close, volume]
+            sorted by date ascending.  At least 60 rows are recommended so
+            that all indicators have enough history.
+
+    Returns:
+        A numpy float32 array of shape ``(MARKET_FEATURE_DIM,)``, or ``None``
+        if the DataFrame is too short or feature computation fails.
+    """
+    frame = compute_feature_frame(df)
+    if frame is None or frame.empty:
+        return None
+
+    last_close = float(df["close" if "close" in df.columns else "Close"].iloc[-1])
+    if last_close == 0:
+        return None
+
+    return frame.iloc[-1].to_numpy(dtype=np.float32)
+
+
+def build_guardian_obs(
+    market_features: np.ndarray,
+    unrealized_pnl_pct: float,
+    bars_in_trade: float,
+) -> np.ndarray:
+    """Build the 17-dim Guardian observation for an open position.
+
+    Args:
+        market_features:    The 15-dim market feature vector for the symbol.
+        unrealized_pnl_pct: (current_price - buy_price) / buy_price.
+        bars_in_trade:      Number of bars the position has been open.
+
+    Returns:
+        float32 array of shape ``(GUARDIAN_DIM,)``.
+    """
+    pnl = float(np.clip(unrealized_pnl_pct, -0.5, 0.5))
+    bars = min(float(bars_in_trade), 20.0) / 20.0
+    obs = np.concatenate(
+        [np.asarray(market_features, dtype=np.float32), [pnl, bars]]
+    ).astype(np.float32)
+    assert obs.shape == (GUARDIAN_DIM,)
+    return obs
+
+
+def build_executive_obs(
+    market_features: np.ndarray,
+    open_positions_frac: float,
+    nifty_ret_5d: float,
+) -> np.ndarray:
+    """Build the 17-dim Executive observation for a buy candidate.
+
+    Args:
+        market_features:     The 15-dim market feature vector for the symbol.
+        open_positions_frac: open_count / MAX_SLOTS, in [0, 1].
+        nifty_ret_5d:        5-day return of ^NSEI (clipped to [-0.2, 0.2]).
+
+    Returns:
+        float32 array of shape ``(EXECUTIVE_DIM,)``.
+    """
+    frac = float(np.clip(open_positions_frac, 0.0, 1.0))
+    nifty = float(np.clip(nifty_ret_5d, -0.2, 0.2))
+    obs = np.concatenate(
+        [np.asarray(market_features, dtype=np.float32), [frac, nifty]]
+    ).astype(np.float32)
+    assert obs.shape == (EXECUTIVE_DIM,)
+    return obs

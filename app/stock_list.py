@@ -1,11 +1,12 @@
 """
 stock_list.py – Curated list of NSE stock symbols used by the AITrader scanner.
 
-Symbols are in Yahoo Finance format (suffix ".NS") so they can be fetched with
-yfinance in Paper mode.  The trading engine uses the bare symbol (without ".NS")
-when routing to Shoonya in Live mode.
+Symbols are in Yahoo Finance format (suffix ".NS").  All internal logic and
+the database use the BASE symbol (see app/symbols.py); conversion happens at
+the yfinance / Shoonya edges.
 
-Extend NSE_SYMBOLS to include the full 1 500-stock universe as required.
+The universe is ~145 names (NIFTY 50 + Next 50 selection + mid-caps); the
+1,500-stock expansion is future work.
 """
 
 NSE_SYMBOLS: list[str] = [
@@ -22,12 +23,14 @@ NSE_SYMBOLS: list[str] = [
     "BRITANNIA.NS", "HINDALCO.NS", "UPL.NS", "SHREECEM.NS", "VEDL.NS",
 
     # NIFTY NEXT 50 (selection)
-    "ADANIENT.NS", "ADANIGREEN.NS", "ADANITRANS.NS", "AMBUJACEM.NS", "AUROPHARMA.NS",
+    # ADANITRANS was renamed to ADANIENSOL (Adani Energy Solutions) in 2023.
+    "ADANIENT.NS", "ADANIGREEN.NS", "ADANIENSOL.NS", "AMBUJACEM.NS", "AUROPHARMA.NS",
     "BANDHANBNK.NS", "BERGEPAINT.NS", "BIOCON.NS", "BOSCHLTD.NS", "CHOLAFIN.NS",
     "COLPAL.NS", "CONCOR.NS", "DABUR.NS", "DLF.NS", "GAIL.NS",
     "GODREJCP.NS", "HAVELLS.NS", "ICICIGI.NS", "ICICIPRULI.NS", "INDUSTOWER.NS",
     "INDIGO.NS", "IOC.NS", "IRCTC.NS", "JUBLFOOD.NS", "LICHSGFIN.NS",
-    "LUPIN.NS", "MARICO.NS", "MCDOWELL-N.NS", "MUTHOOTFIN.NS", "NAUKRI.NS",
+    # MCDOWELL-N was renamed to UNITDSPR (United Spirits), already listed below.
+    "LUPIN.NS", "MARICO.NS", "MUTHOOTFIN.NS", "NAUKRI.NS",
     "NMDC.NS", "PAGEIND.NS", "PETRONET.NS", "PIDILITIND.NS", "PNB.NS",
     "RECLTD.NS", "SIEMENS.NS", "SRF.NS", "TATACOMM.NS", "TORNTPHARM.NS",
     "TRENT.NS", "UNITDSPR.NS", "VOLTAS.NS", "WHIRLPOOL.NS", "ZOMATO.NS",
