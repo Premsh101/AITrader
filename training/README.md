@@ -21,9 +21,20 @@ Key design points:
 - **Costs**: every reward pays `COST_BPS = 25` bps **per side**
   (`training/common.py`) — an approximation of brokerage + STT + slippage on
   NSE. A model that only learns cost-free edges is worthless.
-- **Budget**: `--timesteps` defaults to 1M per brain. The previous
-  Hunter/Guardian were trained ~5M steps; raise to `--timesteps 5000000` once
-  the 1M run's evaluation looks sane.
+- **Budget**: `--timesteps` defaults to 1M per brain — a fast first
+  iteration, NOT the final word. The previous Hunter/Guardian were trained
+  ~5M steps (the Executive ~1M). To match that budget exactly:
+
+  ```
+  python training/train_triad.py --brains hunter    --timesteps 5000000
+  python training/train_triad.py --brains guardian  --timesteps 5000000
+  python training/train_triad.py --brains executive --timesteps 1000000
+  ```
+
+  Expect very roughly 2–5 hours per 5M-step brain on Kaggle CPU. More steps
+  generally help but with diminishing returns — the out-of-sample evaluation
+  verdict, not wall-clock time, is the measure of quality. Run the 1M pass
+  first to check the pipeline, then spend the 5M budget.
 - **Checkpoints** every 100k steps into `checkpoints/`, so Kaggle's 12-hour
   session limit can't lose a run (`--resume-from checkpoints/<file>.zip` with
   a single `--brains` selection to continue).
