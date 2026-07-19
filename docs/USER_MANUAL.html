@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AITrader – User Manual</title>
+<style>
+  :root {
+    --bg: #ffffff; --text: #1f2430; --muted: #5b6472;
+    --accent: #4f46e5; --card: #f5f6fa; --border: #e3e6ee;
+    --ok: #15803d; --warn: #b45309; --bad: #b91c1c;
+    --code-bg: #0f172a; --code-text: #e2e8f0;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117; --text: #e6e9f0; --muted: #9aa4b2;
+      --accent: #818cf8; --card: #161b26; --border: #2a3140;
+      --ok: #4ade80; --warn: #fbbf24; --bad: #f87171;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 16px/1.65 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 32px 20px 80px; }
+  h1 { font-size: 1.9rem; margin: 0 0 4px; }
+  h2 { font-size: 1.35rem; margin: 44px 0 12px; padding-top: 20px; border-top: 1px solid var(--border); }
+  h3 { font-size: 1.05rem; margin: 24px 0 8px; }
+  p, li { color: var(--text); }
+  .sub { color: var(--muted); margin-top: 0; }
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 10px; padding: 16px 18px; margin: 14px 0;
+  }
+  .ok   { border-left: 4px solid var(--ok); }
+  .warn { border-left: 4px solid var(--warn); }
+  .bad  { border-left: 4px solid var(--bad); }
+  .badge { font-weight: 700; }
+  .badge.ok   { color: var(--ok); }
+  .badge.warn { color: var(--warn); }
+  .badge.bad  { color: var(--bad); }
+  pre {
+    background: var(--code-bg); color: var(--code-text);
+    padding: 14px 16px; border-radius: 8px; overflow-x: auto;
+    font-size: 0.88rem; line-height: 1.5;
+  }
+  code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  p code, li code, td code {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 4px; padding: 1px 5px; font-size: 0.87em;
+  }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 0.92rem; }
+  th, td { border: 1px solid var(--border); padding: 8px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--card); }
+  .tablebox { overflow-x: auto; }
+  ol.steps > li { margin-bottom: 10px; }
+  .toc { columns: 2; column-gap: 32px; }
+  .toc a { color: var(--accent); text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+  @media (max-width: 640px) { .toc { columns: 1; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>AITrader – User Manual</h1>
+<p class="sub">Step-by-step guide: from training the AI models to running the system safely.</p>
+
+<h2 id="status">1. Current readiness — in simple words</h2>
+
+<div class="card ok">
+  <span class="badge ok">✅ READY — the software.</span>
+  All the bugs that stopped trading are fixed: symbol formats, security,
+  the trading loop, order prices, and the database setup. 37 automated tests pass.
+</div>
+
+<div class="card bad">
+  <span class="badge bad">❌ NOT READY — the AI models.</span>
+  The old model files were trained on different data shapes and never worked.
+  They are parked in <code>models/legacy/</code>. <strong>You must train new
+  models on Kaggle first</strong> (Step&nbsp;3 below). Until then the app runs,
+  the dashboard works, but it will refuse to trade — on purpose.
+</div>
+
+<div class="card warn">
+  <span class="badge warn">⚠️ NEEDS YOUR INPUT — configuration.</span>
+  Before deploying you must set a few new settings in your <code>.env</code>
+  file (an API key, allowed dashboard address, capital per trade). Step&nbsp;5 covers this.
+</div>
+
+<p><strong>Bottom line:</strong> merge the pull request → train models on Kaggle →
+if the evaluation says PASS, add the models to the repo → deploy → run in
+Paper mode for a while → only then consider Live.</p>
+
+<h2 id="toc">2. Contents</h2>
+<div class="toc">
+  <p>
+    <a href="#step-merge">Step 1 – Merge the pull request</a><br>
+    <a href="#step-models">Step 2 – Understand the models question</a><br>
+    <a href="#step-kaggle">Step 3 – Train the models on Kaggle</a><br>
+    <a href="#step-eval">Step 4 – Evaluate: the go / no-go gate</a><br>
+    <a href="#step-env">Step 5 – Configure the server (.env)</a><br>
+    <a href="#step-deploy">Step 6 – Deploy with Docker</a><br>
+    <a href="#step-verify">Step 7 – Verify everything works</a><br>
+    <a href="#step-paper">Step 8 – Run in Paper mode</a><br>
+    <a href="#step-live">Step 9 – Going Live (read carefully)</a><br>
+    <a href="#envref">Appendix A – All settings explained</a><br>
+    <a href="#trouble">Appendix B – Troubleshooting</a>
+  </p>
+</div>
+
+<h2 id="step-merge">Step 1 – Merge the pull request</h2>
+<ol class="steps">
+  <li>Open PR <strong>#12</strong> (“Repair trading pipeline”) on GitHub.</li>
+  <li>Review and merge it into <code>main</code>.</li>
+</ol>
+<p>Nothing will start trading after the merge — the app waits for valid models.</p>
+
+<h2 id="step-models">Step 2 – Do we need to create the models again?</h2>
+<p><strong>Short answer: yes, they must be trained again — but you don't have to
+build anything yourself.</strong> Everything is already written for you:</p>
+<ul>
+  <li>The old model files cannot be reused or “fixed”: they expect 5 numbers as
+      input while the app produces 15, and the notebooks that made them are lost.</li>
+  <li>The repo now contains a ready-made training script
+      (<code>training/train_triad.py</code>). Running it <em>creates and trains</em>
+      all three models (Hunter, Guardian, Executive) in one go.</li>
+  <li>You only need to run it on Kaggle (free) and copy three files back. That's Step&nbsp;3.</li>
+</ul>
+
+<h2 id="step-kaggle">Step 3 – Train the models on Kaggle</h2>
+<ol class="steps">
+  <li>Go to <code>kaggle.com</code> → <em>Create → New Notebook</em>. CPU is fine.</li>
+  <li>In the notebook settings, turn <strong>Internet ON</strong>.</li>
+  <li>Cell 1 — get the code and install the libraries:
+<pre><code>!git clone https://github.com/Premsh101/AITrader.git
+%cd AITrader
+!pip install -q "stable-baselines3==2.8.0" "numpy&gt;=2.0" "pandas_ta==0.4.67b0" "yfinance&gt;=0.2.40"</code></pre></li>
+  <li>Cell 2 — quick 2-minute test that everything runs (do this first!):
+<pre><code>!python training/train_triad.py --smoke
+!python training/evaluate_triad.py --smoke</code></pre>
+      This also confirms all stock symbols still download correctly from Yahoo.</li>
+  <li>Cell 3 — the real training (takes a few hours):
+<pre><code>!python training/train_triad.py --timesteps 1000000</code></pre>
+      Tip: if a session hits Kaggle's 12-hour limit, progress is saved every
+      100k steps in <code>checkpoints/</code>. You can also train one model per
+      session with <code>--brains hunter</code>, then <code>guardian</code>,
+      then <code>executive</code>.</li>
+</ol>
+
+<h2 id="step-eval">Step 4 – Evaluate: the go / no-go gate</h2>
+<ol class="steps">
+  <li>Still on Kaggle, run:
+<pre><code>!python training/evaluate_triad.py</code></pre></li>
+  <li>This replays the whole trading pipeline on data the models have
+      <em>never seen</em>, including realistic trading costs, and prints a verdict:
+      <ul>
+        <li><strong>VERDICT: PASS</strong> – the strategy beat simply holding the
+            NIFTY index. OK to deploy.</li>
+        <li><strong>VERDICT: FAIL</strong> – it did not.
+            <strong>Do not deploy.</strong> Adjust the training settings and retrain.
+            Never put a failing model in front of real money.</li>
+      </ul></li>
+  <li>On PASS: download these three files from Kaggle's file browser
+      (inside <code>AITrader/models/</code>):
+      <ul>
+        <li><code>hunter_apex_1500_brain.zip</code></li>
+        <li><code>guardian_apex_1500_brain.zip</code></li>
+        <li><code>executive_apex_manager.zip</code></li>
+      </ul></li>
+  <li>Commit them into the repo's <code>models/</code> folder (same names) and push.</li>
+</ol>
+<p>Safety net: if a wrong or old file ends up in <code>models/</code>, the app
+detects the mismatch, refuses to trade, and shows an error in the dashboard.</p>
+
+<h2 id="step-env">Step 5 – Configure the server (.env)</h2>
+<ol class="steps">
+  <li>On your VPS, copy <code>.env.example</code> to <code>.env</code>.</li>
+  <li>Generate a strong API key:
+<pre><code>openssl rand -hex 32</code></pre></li>
+  <li>Fill in at minimum:
+<pre><code>AITRADER_API_KEY=&lt;the random key&gt;
+NEXT_PUBLIC_API_KEY=&lt;the SAME key&gt;
+ALLOWED_ORIGINS=https://your-dashboard-domain.example
+TRADE_CAPITAL_PER_SLOT=10000        # rupees per position
+SHOONYA_USER=... (and the other broker fields, only needed for Live)</code></pre></li>
+</ol>
+<p>Why: every button that can change something (switch mode, place an order)
+now requires this key. Without it, strangers who find your server's address
+can do nothing.</p>
+
+<h2 id="step-deploy">Step 6 – Deploy with Docker</h2>
+<ol class="steps">
+  <li>Pull the latest <code>main</code> (with the new models) on the VPS.</li>
+  <li>Run:
+<pre><code>docker compose up --build -d</code></pre></li>
+  <li>Database tables are created automatically on first start (migrations run
+      in the container entrypoint). Existing databases are upgraded in place —
+      no manual steps.</li>
+  <li><strong>Important networking change:</strong> the app, dashboard and
+      database now listen only on <code>127.0.0.1</code> (the server itself).
+      Your reverse proxy (Coolify) must forward public traffic to
+      <code>127.0.0.1:8005</code> (API) and <code>127.0.0.1:8006</code>
+      (dashboard). If Coolify connects over a Docker network instead, adjust
+      the <code>ports:</code> lines in <code>docker-compose.yml</code>.</li>
+</ol>
+
+<h2 id="step-verify">Step 7 – Verify everything works</h2>
+<ol class="steps">
+  <li>Check the API:
+<pre><code>curl http://127.0.0.1:8005/health</code></pre>
+      Expect: <code>{"status":"ok","brains_ready":true}</code>.
+      If <code>brains_ready</code> is <code>false</code>, the model files are
+      missing or wrong — see Appendix&nbsp;B.</li>
+  <li>Open the dashboard in your browser. The activity feed should show
+      “Trading cycle started / complete” during market hours
+      (Mon–Fri 09:15–15:30 IST). Outside those hours it stays quiet — that's normal.</li>
+  <li>Try a manual paper order without the key — it must be rejected (401):
+<pre><code>curl -X POST http://127.0.0.1:8005/order \
+  -H 'Content-Type: application/json' \
+  -d '{"symbol":"TCS","quantity":1,"side":"BUY","reference_price":4000}'</code></pre></li>
+</ol>
+
+<h2 id="step-paper">Step 8 – Run in Paper mode</h2>
+<ul>
+  <li>The system starts in <strong>Paper mode</strong>: it simulates trades with
+      real market prices but no real money and no broker connection.</li>
+  <li>Let it run for <strong>at least a few weeks</strong>. Watch the dashboard:
+      total P&amp;L, win rate, and whether its decisions look sane.</li>
+  <li>Paper results are recorded at the last daily closing price — treat them as
+      an approximation, slightly optimistic versus reality.</li>
+</ul>
+
+<h2 id="step-live">Step 9 – Going Live (read carefully)</h2>
+<div class="card warn">
+  <strong>Live mode trades real money automatically.</strong> Only switch after:
+  the evaluation PASSED, paper trading looked healthy for weeks, and broker
+  credentials are set in <code>.env</code>.
+</div>
+<ol class="steps">
+  <li>Flip the toggle in the dashboard header. You'll get a confirmation popup —
+      this is deliberate; the backend also refuses the switch without it.</li>
+  <li>Know the rules the system follows in Live mode:
+    <ul>
+      <li>Maximum <strong>5 positions</strong> at once, about
+          <code>TRADE_CAPITAL_PER_SLOT</code> rupees each.</li>
+      <li>Orders are <strong>intraday</strong> (product “I”): the broker
+          force-closes anything still open around <strong>15:20 IST</strong>.
+          The app stops opening new positions after 15:15 IST for this reason.</li>
+      <li>Recorded fill prices are best-effort (quote just after the order),
+          not exact fills — small differences vs. your broker statement are expected.</li>
+    </ul></li>
+  <li>To stop: flip back to Paper anytime, or <code>docker compose down</code>.</li>
+</ol>
+
+<h2 id="envref">Appendix A – All settings explained</h2>
+<div class="tablebox">
+<table>
+  <tr><th>Setting</th><th>What it does</th><th>Default</th></tr>
+  <tr><td><code>AITRADER_API_KEY</code></td><td>Password for every action that changes something. If empty, those actions are blocked (safe by default).</td><td>— (required)</td></tr>
+  <tr><td><code>NEXT_PUBLIC_API_KEY</code></td><td>Same key, given to the dashboard at build time so its buttons work.</td><td>— (required)</td></tr>
+  <tr><td><code>ALLOWED_ORIGINS</code></td><td>Which website address(es) may call the API from a browser.</td><td><code>http://localhost:8006</code></td></tr>
+  <tr><td><code>TRADE_CAPITAL_PER_SLOT</code></td><td>Rupees invested per position. Quantity = this ÷ share price.</td><td><code>10000</code></td></tr>
+  <tr><td><code>TRADING_LOOP_INTERVAL</code></td><td>Seconds between trading checks.</td><td><code>300</code></td></tr>
+  <tr><td><code>FETCH_TTL_SECONDS</code></td><td>How long market data is reused before asking Yahoo again (prevents IP blocks).</td><td><code>900</code></td></tr>
+  <tr><td><code>TRADING_ALWAYS_ON</code></td><td>Set to <code>1</code> to ignore market hours — for testing only.</td><td><code>0</code></td></tr>
+  <tr><td><code>DATABASE_URL</code></td><td>Database connection (already set by docker-compose).</td><td>compose default</td></tr>
+  <tr><td><code>SHOONYA_*</code> (6 values)</td><td>Broker login. Needed only for Live mode.</td><td>—</td></tr>
+</table>
+</div>
+
+<h2 id="trouble">Appendix B – Troubleshooting</h2>
+<div class="tablebox">
+<table>
+  <tr><th>Symptom</th><th>Meaning</th><th>Fix</th></tr>
+  <tr>
+    <td>Dashboard shows repeated ERROR “AI brains not ready … skipping trading cycle”</td>
+    <td>The three model files are missing from <code>models/</code>, or they don't match the app (wrong shape).</td>
+    <td>Do Steps 3–4, commit the three zips with the exact filenames, redeploy.</td>
+  </tr>
+  <tr>
+    <td>Button in dashboard does nothing / errors with 401</td>
+    <td>API key mismatch.</td>
+    <td>Make sure <code>AITRADER_API_KEY</code> and <code>NEXT_PUBLIC_API_KEY</code> are identical, then rebuild: <code>docker compose up --build -d</code> (the dashboard bakes the key in at build time).</td>
+  </tr>
+  <tr>
+    <td>Mutating request returns 503 “API key not configured”</td>
+    <td><code>AITRADER_API_KEY</code> is empty on the server.</td>
+    <td>Set it in <code>.env</code> and restart.</td>
+  </tr>
+  <tr>
+    <td>Switching to LIVE is rejected</td>
+    <td>The extra safety check: the request must include <code>confirm: true</code>.</td>
+    <td>Use the dashboard toggle (it sends it after your confirmation popup).</td>
+  </tr>
+  <tr>
+    <td>“No market data returned – skipping cycle”</td>
+    <td>Yahoo Finance is unreachable or rate-limiting your server.</td>
+    <td>Usually temporary. If persistent, raise <code>FETCH_TTL_SECONDS</code>; check the server's internet access.</td>
+  </tr>
+  <tr>
+    <td>Nothing happens all day</td>
+    <td>It's outside NSE market hours (Mon–Fri 09:15–15:30 IST) — the loop sleeps by design.</td>
+    <td>Wait for market hours, or set <code>TRADING_ALWAYS_ON=1</code> temporarily to test.</td>
+  </tr>
+  <tr>
+    <td>A stock never trades / warnings about one symbol</td>
+    <td>Its ticker may have been renamed or delisted on Yahoo.</td>
+    <td>Remove or update it in <code>app/stock_list.py</code>.</td>
+  </tr>
+</table>
+</div>
+
+<p class="sub" style="margin-top:40px">AITrader · manual generated 2026-07-19 · see also <code>CHANGES.md</code> and <code>training/README.md</code> in the repo.</p>
+
+</div>
+</body>
+</html>
