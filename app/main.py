@@ -49,9 +49,10 @@ import numpy as np
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app import symbols
+from app import risk, symbols
 from app.ai_brains import MAX_SLOTS, BrainManager
 from app.database import get_db, SessionLocal
 from app.feature_engine import (
@@ -143,7 +144,10 @@ def _get_market_data_cached() -> dict[str, Any]:
     if _market_cache["data"] and (now - _market_cache["ts"]) < FETCH_TTL_SECONDS:
         return _market_cache["data"]
 
-    yahoo_tickers = [symbols.to_yahoo(s) for s in NSE_SYMBOLS] + [NIFTY_YAHOO]
+    yahoo_tickers = [symbols.to_yahoo(s) for s in NSE_SYMBOLS] + [
+        NIFTY_YAHOO,
+        risk.VIX_YAHOO,
+    ]
     raw = shoonya.get_market_data(yahoo_tickers)
     data = {symbols.to_base(yahoo_sym): df for yahoo_sym, df in raw.items()}
 
@@ -151,6 +155,17 @@ def _get_market_data_cached() -> dict[str, Any]:
         _market_cache["data"] = data
         _market_cache["ts"] = now
     return data
+
+
+def _close_trade(db: Session, trade: Trade, exit_price: float, reason: str) -> None:
+    """Mark an open trade CLOSED at *exit_price*, recording why."""
+    trade.sell_price = Decimal(str(exit_price))
+    if trade.buy_price is not None:
+        trade.pnl = (Decimal(str(exit_price)) - trade.buy_price) * trade.quantity
+    trade.status = TradeStatus.CLOSED
+    trade.exit_reason = reason
+    trade.updated_at = datetime.now(timezone.utc)
+    db.commit()
 
 
 def _last_close(df) -> float | None:
@@ -196,6 +211,23 @@ def _run_trading_cycle() -> None:
 
     db: Session = SessionLocal()
     try:
+        config: SystemConfig | None = db.query(SystemConfig).first()
+        if not config:
+            config = SystemConfig(is_live_mode=False)
+            db.add(config)
+            db.commit()
+            db.refresh(config)
+
+        # Death-protocol halt: nothing runs until the operator re-enables.
+        if config.is_halted:
+            _log_activity(
+                "Risk",
+                "System HALTED by death protocol – no trading until is_halted "
+                "is cleared via PATCH /config.",
+                level=logging.ERROR,
+            )
+            return
+
         _log_activity("System", "Trading cycle started")
         now_ist = datetime.now(IST)
 
@@ -219,8 +251,9 @@ def _run_trading_cycle() -> None:
 
         # ── 2. Generate features (base-symbol keyed) ──────────────────────
         symbol_features: dict[str, np.ndarray] = {}
+        index_keys = {symbols.to_base(NIFTY_YAHOO), symbols.to_base(risk.VIX_YAHOO)}
         for sym, df in market_data.items():
-            if sym == symbols.to_base(NIFTY_YAHOO):
+            if sym in index_keys:
                 continue
             feat = generate_features(df)
             if feat is not None:
@@ -235,8 +268,41 @@ def _run_trading_cycle() -> None:
             f"Found {len(buy_signals)} buy signal(s): {', '.join(buy_signals[:10])}{'…' if len(buy_signals) > 10 else ''}",
         )
 
-        # ── 4. Executive selects slots (excluding held symbols) ───────────
+        # ── 3b. Equity tracking & death protocol ──────────────────────────
         open_trades = db.query(Trade).filter(Trade.status == TradeStatus.OPEN).all()
+        realized = float(
+            db.query(func.coalesce(func.sum(Trade.pnl), 0))
+            .filter(Trade.status == TradeStatus.CLOSED)
+            .scalar()
+        )
+        unrealized = 0.0
+        for t in open_trades:
+            last = _last_close(market_data.get(t.symbol))
+            if last is not None and t.buy_price is not None:
+                unrealized += (last - float(t.buy_price)) * t.quantity
+        equity = risk.BASE_CAPITAL + realized + unrealized
+
+        peak_equity = max(float(config.peak_equity or equity), equity)
+        config.peak_equity = Decimal(str(round(peak_equity, 2)))
+        db.commit()
+
+        if equity < risk.death_threshold(peak_equity):
+            _log_activity(
+                "Risk",
+                f"DEATH PROTOCOL: equity ₹{equity:,.0f} fell below "
+                f"{100 * (1 - risk.DEATH_DRAWDOWN):.0f}% of peak "
+                f"₹{peak_equity:,.0f}. Flattening all positions and halting.",
+                level=logging.ERROR,
+            )
+            for t in open_trades:
+                exit_price = _last_close(market_data.get(t.symbol))
+                if exit_price is not None:
+                    _close_trade(db, t, exit_price, "death-protocol")
+            config.is_halted = True
+            db.commit()
+            return
+
+        # ── 4. Executive selects slots (excluding held symbols) ───────────
         held = {t.symbol for t in open_trades}
         buy_signals = [s for s in buy_signals if s not in held]
 
@@ -255,14 +321,24 @@ def _run_trading_cycle() -> None:
             buy_signals, executive_obs, available_slots
         )
 
-        config: SystemConfig | None = db.query(SystemConfig).first()
-        is_live = config.is_live_mode if config else False
+        is_live = config.is_live_mode
         mode = TradeMode.LIVE if is_live else TradeMode.PAPER
 
         if selected and not TRADING_ALWAYS_ON and not _entries_allowed(now_ist):
             _log_activity(
                 "Executive",
                 f"Skipping {len(selected)} entry(ies) – past 15:15 IST square-off cutoff",
+            )
+            selected = []
+
+        # VIX filter: a fear spike blocks new entries; exits keep running.
+        if selected and risk.vix_entries_blocked(
+            market_data.get(symbols.to_base(risk.VIX_YAHOO))
+        ):
+            _log_activity(
+                "Risk",
+                f"India VIX spiked more than {risk.VIX_SPIKE_PCT:.0%} today – "
+                f"blocking {len(selected)} new entry(ies)",
             )
             selected = []
 
@@ -296,8 +372,10 @@ def _run_trading_cycle() -> None:
                 )
                 logger.exception("Order placement failed for %s", sym)
 
-        # ── 5. Guardian checks open trades ────────────────────────────────
+        # ── 5. Risk overlays + Guardian check every open trade ───────────
         for trade in open_trades:
+            if trade.status != TradeStatus.OPEN:
+                continue  # closed above by the death protocol
             feat = symbol_features.get(trade.symbol)
             last_close = _last_close(market_data.get(trade.symbol))
             if feat is None or last_close is None or trade.buy_price is None:
@@ -305,6 +383,12 @@ def _run_trading_cycle() -> None:
 
             buy_price = float(trade.buy_price)
             unrealized_pnl_pct = (last_close - buy_price) / buy_price
+
+            # Track the highest close since entry for the profit ladder.
+            peak_price = max(float(trade.peak_price or buy_price), last_close)
+            trade.peak_price = Decimal(str(peak_price))
+            peak_pnl_pct = (peak_price - buy_price) / buy_price
+
             # Calendar days ≈ daily bars; close enough for the 0–20 bar
             # feature and avoids needing an exchange calendar.
             created = trade.created_at
@@ -314,30 +398,33 @@ def _run_trading_cycle() -> None:
                 (datetime.now(timezone.utc) - created).days if created else 0
             )
 
-            obs = build_guardian_obs(feat, unrealized_pnl_pct, bars_in_trade)
-            if brains.guardian.should_close(obs, symbol=trade.symbol):
-                _log_activity("Guardian", f"Closing position → {trade.symbol}")
-                try:
-                    ltp = shoonya.get_live_price(trade.symbol) if is_live else None
-                    exit_price = ltp if ltp else last_close
+            # Deterministic overlays first – the Guardian cannot veto them.
+            reason = risk.overlay_exit_reason(
+                unrealized_pnl_pct, peak_pnl_pct, bars_in_trade
+            )
+            if reason is None:
+                obs = build_guardian_obs(feat, unrealized_pnl_pct, bars_in_trade)
+                if brains.guardian.should_close(obs, symbol=trade.symbol):
+                    reason = "guardian"
 
-                    trade.sell_price = Decimal(str(exit_price))
-                    trade.pnl = (
-                        Decimal(str(exit_price)) - trade.buy_price
-                    ) * trade.quantity
-                    trade.status = TradeStatus.CLOSED
-                    trade.updated_at = datetime.now(timezone.utc)
-                    db.commit()
-                except Exception:
-                    db.rollback()
-                    _log_activity(
-                        "Guardian",
-                        f"Failed to close trade id={trade.id} ({trade.symbol})",
-                        level=logging.ERROR,
-                    )
-                    logger.exception("Guardian failed to close trade id=%s", trade.id)
-            else:
+            if reason is None:
+                db.commit()  # persist peak_price update
                 _log_activity("Guardian", f"Holding position → {trade.symbol}")
+                continue
+
+            agent = "Guardian" if reason == "guardian" else "Risk"
+            _log_activity(agent, f"Closing position → {trade.symbol} ({reason})")
+            try:
+                ltp = shoonya.get_live_price(trade.symbol) if is_live else None
+                _close_trade(db, trade, ltp if ltp else last_close, reason)
+            except Exception:
+                db.rollback()
+                _log_activity(
+                    agent,
+                    f"Failed to close trade id={trade.id} ({trade.symbol})",
+                    level=logging.ERROR,
+                )
+                logger.exception("Failed to close trade id=%s", trade.id)
 
         # ── Update last_sync_time ─────────────────────────────────────────
         if config:
@@ -411,8 +498,10 @@ class OrderRequest(BaseModel):
     reference_price: float | None = None
 
 
-class LiveModeUpdate(BaseModel):
-    is_live_mode: bool
+class ConfigUpdate(BaseModel):
+    is_live_mode: bool | None = None
+    # Clearing this re-arms trading after the death protocol fired.
+    is_halted: bool | None = None
 
 
 class ToggleModeRequest(BaseModel):
@@ -486,6 +575,7 @@ def list_trades(
             "sell_price": str(t.sell_price) if t.sell_price is not None else None,
             "pnl": str(t.pnl) if t.pnl is not None else None,
             "broker_order_id": t.broker_order_id,
+            "exit_reason": t.exit_reason,
             "created_at": t.created_at.isoformat() if t.created_at else None,
             "updated_at": t.updated_at.isoformat() if t.updated_at else None,
         }
@@ -537,25 +627,34 @@ def get_config(db: Session = Depends(get_db)):
     """Return the current system configuration."""
     config = db.query(SystemConfig).first()
     if not config:
-        return {"is_live_mode": False, "last_sync_time": None}
+        return {"is_live_mode": False, "is_halted": False, "last_sync_time": None}
     return {
         "is_live_mode": config.is_live_mode,
+        "is_halted": config.is_halted,
+        "peak_equity": str(config.peak_equity) if config.peak_equity is not None else None,
         "last_sync_time": config.last_sync_time,
     }
 
 
 @app.patch("/config", response_model=dict, dependencies=[Depends(require_api_key)])
-def update_config(payload: LiveModeUpdate, db: Session = Depends(get_db)):
-    """Toggle Paper / Live mode at runtime."""
+def update_config(payload: ConfigUpdate, db: Session = Depends(get_db)):
+    """Update runtime config: Paper/Live mode and the death-protocol halt."""
     config = db.query(SystemConfig).first()
     if not config:
-        config = SystemConfig(is_live_mode=payload.is_live_mode)
+        config = SystemConfig(is_live_mode=False)
         db.add(config)
-    else:
+    if payload.is_live_mode is not None:
         config.is_live_mode = payload.is_live_mode
+    if payload.is_halted is not None:
+        config.is_halted = payload.is_halted
+        if not payload.is_halted:
+            # Re-arm with a fresh high-water mark so the protocol doesn't
+            # immediately re-fire on the drawn-down equity.
+            config.peak_equity = None
+            _log_activity("Risk", "Death-protocol halt cleared by operator")
     db.commit()
     db.refresh(config)
-    return {"is_live_mode": config.is_live_mode}
+    return {"is_live_mode": config.is_live_mode, "is_halted": config.is_halted}
 
 
 @app.post("/order", response_model=dict, dependencies=[Depends(require_api_key)])
