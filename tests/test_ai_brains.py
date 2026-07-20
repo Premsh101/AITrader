@@ -93,6 +93,25 @@ def test_executive_probability_ranking(tmp_path, monkeypatch):
     assert len(selected) <= 2
 
 
+def test_executive_threshold_gates_selection(tmp_path, monkeypatch):
+    """Patching the module-level threshold (as tournament.py's sweep does)
+    must tighten/loosen the entry bar without reloading the model."""
+    monkeypatch.setattr(ai_brains, "MODELS_DIR", str(tmp_path))
+    _save_tiny_ppo(
+        str(tmp_path / ai_brains.ExecutiveBrain.MODEL_FILE),
+        obs_dim=ai_brains.ExecutiveBrain.OBS_DIM,
+    )
+    brain = ai_brains.ExecutiveBrain()
+    brain.load()
+    obs = np.zeros(ai_brains.ExecutiveBrain.OBS_DIM, np.float32)
+
+    monkeypatch.setattr(ai_brains, "EXECUTIVE_APPROVE_THRESHOLD", 0.99)
+    assert brain.select_slots(["A", "B"], {"A": obs, "B": obs}, open_slots=2) == []
+
+    monkeypatch.setattr(ai_brains, "EXECUTIVE_APPROVE_THRESHOLD", 0.0)
+    assert len(brain.select_slots(["A", "B"], {"A": obs, "B": obs}, open_slots=2)) == 2
+
+
 def test_brains_raise_when_not_loaded():
     hunter = ai_brains.HunterBrain()
     with pytest.raises(RuntimeError):
