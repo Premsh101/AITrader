@@ -53,12 +53,15 @@ RUN mkdir -p /app/models /app/logs
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy AI model zip files into the image so they are available at runtime.
+# Bake the shipped model zips into a SEED directory (not /app/models itself).
+# At runtime /app/models is a persistent volume; entrypoint.sh copies these
+# seeds in ONLY when the volume has no model yet, so a redeploy never
+# overwrites the improvements the weekend auto-trainer writes to the volume.
 # Expected files:
 #   ./models/hunter_apex_1500_brain.zip
 #   ./models/guardian_apex_1500_brain.zip
 #   ./models/executive_apex_manager.zip
-COPY ./models /app/models
+COPY ./models /app/model_seeds
 
 # Copy application source and supporting files
 COPY app ./app
