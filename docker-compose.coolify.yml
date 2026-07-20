@@ -1,0 +1,72 @@
+# docker-compose.coolify.yml — Coolify deployment with an EXTERNAL Postgres
+# (e.g. Neon).  Differs from the local-dev docker-compose.yml in three ways:
+#   1. No local `db` service — set DATABASE_URL to your Neon connection string.
+#   2. DATABASE_URL is NOT hardcoded, so Coolify's env value is actually used.
+#   3. /app/models is a NAMED VOLUME, so the daily self-learning retrains
+#      persist across redeploys (the image only seeds an empty volume).
+#
+# In Coolify: New Resource → Docker Compose → point at this repo and set this
+# file as the compose path.  Set the environment variables below in Coolify
+# (they are interpolated here), assign a domain to each service, and mount the
+# `aitrader_models` volume as persistent.
+#
+# Ports: services EXPOSE their container ports; Coolify's proxy routes to them
+# by domain — do not publish host ports here.
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: backend
+    restart: unless-stopped
+    environment:
+      # REQUIRED — your Neon pooled connection string, e.g.
+      #   postgresql://user:pass@ep-xxx-pooler.<region>.aws.neon.tech/aitrader?sslmode=require
+      DATABASE_URL: ${DATABASE_URL}
+      # REQUIRED — shared secret for mutating endpoints (openssl rand -hex 32).
+      AITRADER_API_KEY: ${AITRADER_API_KEY}
+      # Comma-separated dashboard origin(s) allowed by CORS (your dashboard URL).
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
+      # Self-learning: daily retrain during the paper period (gate-guarded).
+      AUTO_RETRAIN: ${AUTO_RETRAIN:-1}
+      AUTO_RETRAIN_SCHEDULE: ${AUTO_RETRAIN_SCHEDULE:-daily}
+      AUTO_RETRAIN_TIMESTEPS: ${AUTO_RETRAIN_TIMESTEPS:-250000}
+      AUTO_RETRAIN_HOUR: ${AUTO_RETRAIN_HOUR:-2}
+      # Shoonya creds are only needed once you switch to LIVE; paper never
+      # calls the broker.  Leave unset for the paper period.
+      SHOONYA_USER: ${SHOONYA_USER:-}
+      SHOONYA_PASSWORD: ${SHOONYA_PASSWORD:-}
+      SHOONYA_TOTP_KEY: ${SHOONYA_TOTP_KEY:-}
+      SHOONYA_VENDOR_CODE: ${SHOONYA_VENDOR_CODE:-}
+      SHOONYA_API_SECRET: ${SHOONYA_API_SECRET:-}
+      SHOONYA_IMEI: ${SHOONYA_IMEI:-}
+    volumes:
+      # Persist BOTH the shipped seed models and the daily-retrained ones.
+      - aitrader_models:/app/models
+      - aitrader_logs:/app/logs
+    expose:
+      - "8000"
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: frontend
+      args:
+        # NEXT_PUBLIC_* are baked into the browser bundle at BUILD time, so
+        # NEXT_PUBLIC_API_URL must be the API's PUBLIC url (the domain you give
+        # the `app` service in Coolify), NOT localhost.
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
+        NEXT_PUBLIC_API_KEY: ${NEXT_PUBLIC_API_KEY:-}
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
+    expose:
+      - "3000"
+    depends_on:
+      - app
+
+volumes:
+  aitrader_models:
+  aitrader_logs:
