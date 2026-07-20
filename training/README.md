@@ -12,6 +12,24 @@ is impossible by construction.
 | Guardian  | 17      | Discrete(2) hold/close| `guardian_apex_1500_brain.zip`  |
 | Executive | 17      | Discrete(2) skip/approve | `executive_apex_manager.zip` |
 
+## v5 strategy: reward alpha, not drift
+
+The gate is "beat buy-and-hold ^NSEI after costs", so the entry brains
+(Hunter, Executive) are now rewarded for **excess return over ^NSEI**, not
+raw forward return. Buying a stock that rises while the index rises just as
+much earns ≈0 and is a net loss after costs — you could have held the index
+for free. Only genuine out-performers pay off.
+
+This is the fix for the v1–v4 failure mode: the old reward
+(`forward_return − cost`) taught the models to buy *any* up-drift, so in a
+rising market they made 350–850 trades, none with a real edge, and always
+finished below the baseline. Rewarding alpha forces selectivity — most
+stocks do **not** beat the index, so the models learn to trade only the ones
+that do. Supporting changes: reward horizon 5→10 bars (matches the ~20-bar
+live hold, less noise), training-cost multiplier 2.0→1.5 (the benchmark
+subtraction now supplies the selectivity pressure), and a gentler Guardian
+time-penalty so winners run long enough to amortise costs.
+
 Key design points:
 
 - **Data**: yfinance daily OHLCV for the repo universe (`app/stock_list.py`)

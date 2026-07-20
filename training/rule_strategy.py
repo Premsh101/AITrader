@@ -29,12 +29,13 @@ class RuleHunter:
         signals = []
         for sym, f in symbol_features.items():
             if (
-                f[0] > 1.02          # price 2% above 20-SMA (trend)
+                f[0] > 1.03          # price 3% above 20-SMA (established trend)
                 and f[6] > 1.0       # EMA9 > EMA21
                 and f[7] > 1.0       # EMA21 > EMA50 (aligned uptrend)
-                and f[11] > 0.02     # +2% momentum over 5 days
-                and f[8] > 1.2       # volume 20% above average (confirmation)
-                and 0.50 < f[1] < 0.75  # RSI strong, not overbought
+                and f[11] > 0.03     # +3% momentum over 5 days (higher bar →
+                                     # fewer, higher-conviction entries)
+                and f[8] > 1.3       # volume 30% above average (confirmation)
+                and 0.55 < f[1] < 0.72  # RSI strong, not overbought
             ):
                 signals.append(sym)
         return signals
@@ -44,8 +45,12 @@ class RuleGuardian:
     ready = True
 
     def should_close(self, obs: np.ndarray, symbol: str = "?") -> bool:
-        # Exit on trend break or blow-off; overlays handle stops/ladder/time.
-        return bool(obs[6] < 0.99 or obs[0] < 0.98 or obs[1] > 0.80)
+        # v5: exit only on a CLEAR trend break or blow-off, so winners are not
+        # whipsawed out on a one-day dip (the main drag on the v4 rule run —
+        # it cut winners early and churned).  The -5% stop, profit ladder and
+        # 20-bar cap overlays still bound risk and time; here we simply stop
+        # closing on shallow noise.
+        return bool(obs[6] < 0.97 or obs[0] < 0.95 or obs[1] > 0.82)
 
 
 class RuleExecutive:
