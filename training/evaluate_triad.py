@@ -5,8 +5,9 @@ deployment.
 
 The full serving pipeline is replayed day by day:
   Hunter signals → drop already-held symbols → Executive approve-probability
-  ranking (>0.5 required) → entries fill free slots → Guardian manages every
-  open position (force-close at 20 bars, matching training).
+  ranking (must exceed EXECUTIVE_APPROVE_THRESHOLD, default 0.5) → entries
+  fill free slots → Guardian manages every open position (force-close at
+  20 bars, matching training).
 
 Trades pay ``ROUND_TRIP_COST`` (2 × COST_BPS per side).  The baseline is
 buy-and-hold ^NSEI over the same window.

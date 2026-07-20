@@ -89,6 +89,27 @@ Key design points:
    or `Files` browser), then commit them to the repo's `models/` directory
    with the exact same filenames and redeploy.
 
+## Multi-seed tournament & threshold sweep
+
+`train_triad.py --seeds N` trains N independent triads (saved with `_s0`,
+`_s1`, … suffixes). `tournament.py --seeds N` then backtests every variant
+on the held-out window **and sweeps the Executive approve threshold**
+(default `0.50,0.60,0.65,0.70`) for each one. Raising the threshold makes
+the Executive reject lower-confidence entries — fewer, higher-conviction
+trades — and because the sweep only re-grades existing zips it takes
+minutes, not a training run:
+
+```python
+!python training/tournament.py --seeds 3
+# or a custom sweep on zips you already have:
+!python training/tournament.py --seeds 3 --thresholds 0.5,0.65,0.75
+```
+
+The winner is the best (variant, threshold) pair; its zips are promoted to
+the canonical filenames. If the verdict is PASS, deploy with the printed
+`EXECUTIVE_APPROVE_THRESHOLD` value in `.env` so serving uses the same
+entry bar the winner was graded at.
+
 ## Go / no-go rule
 
 `evaluate_triad.py` replays the **full pipeline** (Hunter → dedup →
