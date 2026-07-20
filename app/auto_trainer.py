@@ -1,9 +1,9 @@
 """
-auto_trainer.py – Autonomous weekend self-learning (original design's
-"Saturday retraining", with the evaluation gate as promotion criterion).
+auto_trainer.py – Autonomous self-learning, with the walk-forward evaluation
+gate as the promotion criterion.
 
-Every Saturday at AUTO_RETRAIN_HOUR IST (default 02:00), when
-AUTO_RETRAIN=1:
+Runs on a configurable cadence (``AUTO_RETRAIN_SCHEDULE`` = ``daily`` or
+``weekly``) at AUTO_RETRAIN_HOUR IST (default 02:00), when AUTO_RETRAIN=1:
 
   1. Export the system's decision history (trades + ghosts) to CSV.
   2. Copy the current models to a STAGING dir and continue training them
@@ -13,6 +13,12 @@ AUTO_RETRAIN=1:
      FAIL → live models stay untouched; an ERROR lands in the activity log.
 
 The live models can therefore only ever improve — a bad refresh never ships.
+DAILY is useful during the paper-trading period: each run replays the full
+and growing decision history (every executed trade AND every ghost trade the
+Hunter/Executive declined), so the system keeps learning from "what it
+missed" without needing to over-trade. Because promotion still requires
+beating buy-and-hold ^NSEI after costs, a daily run that doesn't improve
+simply keeps the incumbent — daily cadence adds attempts, never risk.
 """
 
 from __future__ import annotations
@@ -29,7 +35,10 @@ logger = logging.getLogger(__name__)
 
 AUTO_RETRAIN = os.environ.get("AUTO_RETRAIN", "1") == "1"
 AUTO_RETRAIN_TIMESTEPS = int(os.environ.get("AUTO_RETRAIN_TIMESTEPS", "250000"))
-AUTO_RETRAIN_HOUR = int(os.environ.get("AUTO_RETRAIN_HOUR", "2"))  # IST, Saturday
+AUTO_RETRAIN_HOUR = int(os.environ.get("AUTO_RETRAIN_HOUR", "2"))  # IST
+# Cadence: "daily" retrains every day at AUTO_RETRAIN_HOUR (useful during the
+# paper-trading period); "weekly" retrains every Saturday. Default weekly.
+AUTO_RETRAIN_SCHEDULE = os.environ.get("AUTO_RETRAIN_SCHEDULE", "weekly").lower()
 
 MODEL_FILES = [
     "hunter_apex_1500_brain.zip",
@@ -49,7 +58,24 @@ def seconds_until_next_saturday(now_ist: datetime) -> float:
     return (target - now_ist).total_seconds()
 
 
-def run_weekend_retrain(models_dir: str, repo_root: str, log_activity) -> bool:
+def seconds_until_next_daily(now_ist: datetime) -> float:
+    """Seconds from *now_ist* to the next AUTO_RETRAIN_HOUR IST (today or tomorrow)."""
+    target = now_ist.replace(
+        hour=AUTO_RETRAIN_HOUR, minute=0, second=0, microsecond=0
+    )
+    if target <= now_ist:
+        target += timedelta(days=1)
+    return (target - now_ist).total_seconds()
+
+
+def seconds_until_next_run(now_ist: datetime) -> float:
+    """Seconds to the next scheduled retrain, per AUTO_RETRAIN_SCHEDULE."""
+    if AUTO_RETRAIN_SCHEDULE == "daily":
+        return seconds_until_next_daily(now_ist)
+    return seconds_until_next_saturday(now_ist)
+
+
+def run_retrain_cycle(models_dir: str, repo_root: str, log_activity) -> bool:
     """One full self-learning cycle. Returns True if new models shipped."""
     staging = os.path.join(models_dir, "staging")
     os.makedirs(staging, exist_ok=True)
@@ -89,7 +115,8 @@ def run_weekend_retrain(models_dir: str, repo_root: str, log_activity) -> bool:
     ]
     if have_models:
         train_cmd.append("--finetune")
-    log_activity("Trainer", f"Weekend self-learning started (finetune={have_models})")
+    log_activity("Trainer",
+                 f"Self-learning started ({AUTO_RETRAIN_SCHEDULE}, finetune={have_models})")
     result = subprocess.run(train_cmd, cwd=repo_root, capture_output=True, text=True,
                             timeout=6 * 3600)
     if result.returncode != 0:
@@ -110,34 +137,42 @@ def run_weekend_retrain(models_dir: str, repo_root: str, log_activity) -> bool:
     if verdict_pass:
         for f in MODEL_FILES:
             shutil.copy2(os.path.join(staging, f), os.path.join(models_dir, f))
-        log_activity("Trainer", "Weekend refresh PASSED the gate – new models live")
+        log_activity("Trainer", "Self-learning refresh PASSED the gate – new models live")
         return True
 
     log_activity(
         "Trainer",
-        "Weekend refresh FAILED the evaluation gate – keeping current models. "
-        "See container logs for the metrics.",
+        "Self-learning refresh FAILED the evaluation gate – keeping current "
+        "models. See container logs for the metrics.",
         level=logging.ERROR,
     )
     logger.error("Evaluation output:\n%s", result.stdout[-2000:])
     return False
 
 
-async def weekend_loop(models_dir: str, repo_root: str, ist_tz, log_activity, brains) -> None:
-    """Background task: sleep to Saturday AUTO_RETRAIN_HOUR IST, retrain, repeat."""
+async def self_learning_loop(models_dir: str, repo_root: str, ist_tz, log_activity, brains) -> None:
+    """Background task: sleep to the next scheduled run, retrain, repeat."""
     if not AUTO_RETRAIN:
-        logger.info("AUTO_RETRAIN=0 – weekend self-learning disabled")
+        logger.info("AUTO_RETRAIN=0 – self-learning disabled")
         return
+    logger.info("Self-learning enabled (schedule=%s, hour=%02d IST)",
+                AUTO_RETRAIN_SCHEDULE, AUTO_RETRAIN_HOUR)
     while True:
-        wait = seconds_until_next_saturday(datetime.now(ist_tz))
-        logger.info("Next weekend self-learning in %.1f hours", wait / 3600)
+        wait = seconds_until_next_run(datetime.now(ist_tz))
+        logger.info("Next %s self-learning in %.1f hours",
+                    AUTO_RETRAIN_SCHEDULE, wait / 3600)
         await asyncio.sleep(wait)
         try:
             shipped = await asyncio.to_thread(
-                run_weekend_retrain, models_dir, repo_root, log_activity
+                run_retrain_cycle, models_dir, repo_root, log_activity
             )
             if shipped:
                 brains.load_all()  # hot-reload the promoted models
         except Exception:
-            logger.exception("Weekend self-learning crashed")
+            logger.exception("Self-learning cycle crashed")
         await asyncio.sleep(3600)  # avoid double-fire within the hour
+
+
+# Backward-compatible aliases (older imports / call sites).
+run_weekend_retrain = run_retrain_cycle
+weekend_loop = self_learning_loop
