@@ -5,15 +5,23 @@ Executive) against the repo's committed feature engine.
 All observations are produced by ``app.feature_engine`` — the same module the
 live app serves from — so train/serve parity is guaranteed by construction.
 
+v5 reward change: the Hunter and Executive are rewarded for EXCESS return
+over ^NSEI (alpha), not raw forward return.  The deployment gate is "beat
+buy-and-hold ^NSEI", so a trade only earns reward for how far it OUTPERFORMS
+the index over the (10-bar) holding window, after costs.  Riding the same
+up-drift the index gives for free is worth ~0 and a net loss after costs —
+which is exactly why v1-v4 over-traded and lost.  See
+``training.common.REWARD_EXCESS_OVER_NIFTY``.
+
 Environments (all PPO, MlpPolicy, Discrete(2)):
-  • HunterEnv    (obs 15): BUY → forward 5-bar return − round-trip cost;
-                 HOLD → small missed-opportunity penalty only when the move
-                 was actually worth taking.
+  • HunterEnv    (obs 15): BUY → (capped forward return − ^NSEI forward
+                 return) − round-trip cost; HOLD → small missed-opportunity
+                 penalty only when the stock actually OUTPERFORMED the index.
   • GuardianEnv  (obs 17): simulates an open long; CLOSE realises P&L − cost;
                  HOLD pays a time penalty plus a drawdown-from-peak penalty;
                  force-close at 20 bars.
-  • ExecutiveEnv (obs 17): APPROVE → forward return − round-trip cost;
-                 SKIP → ~0 with a small missed-opportunity penalty.
+  • ExecutiveEnv (obs 17): APPROVE → excess-over-^NSEI return − round-trip
+                 cost; SKIP → ~0 with a small missed-outperformance penalty.
 
 Usage:
   python training/train_triad.py                 # full run (1M steps each)
@@ -56,6 +64,7 @@ from training.common import (  # noqa: E402
     SymbolData,
     build_dataset,
     download_universe,
+    nifty_fwd_lookup,
     nifty_ret_lookup,
 )
 
@@ -139,6 +148,30 @@ def _forward_return(sd: SymbolData, t: int, horizon: int = FORWARD_BARS) -> floa
     return float(sd.close[t + horizon] / sd.close[t] - 1.0)
 
 
+def _entry_reward(
+    sd: SymbolData, t: int, ds: Dataset, action: int
+) -> float:
+    """Reward for an entry-gate decision (Hunter BUY / Executive APPROVE).
+
+    The trade's downside is capped at the live stop-loss, then the ^NSEI
+    forward return over the same window is subtracted so the model is scored
+    on ALPHA (out-performance), not on merely rising with the market.  Taking
+    a genuine outperformer earns ``excess − cost``; skipping one costs the
+    small missed-opportunity penalty; skipping an index-tracker is free.
+    """
+    fwd = max(_forward_return(sd, t), -TRAIN_STOP_LOSS)
+    excess = fwd - nifty_fwd_lookup(ds, sd.dates[t])
+    if action == ACTION_ACT:
+        reward = excess - TRAIN_ROUND_TRIP_COST
+    else:
+        reward = (
+            MISSED_OPPORTUNITY_PENALTY
+            if excess > MISSED_OPPORTUNITY_THRESHOLD
+            else 0.0
+        )
+    return float(np.clip(reward, -REWARD_CLIP, REWARD_CLIP))
+
+
 # ---------------------------------------------------------------------------
 # Environments
 # ---------------------------------------------------------------------------
@@ -149,7 +182,7 @@ class HunterEnv(gym.Env):
 
     metadata = {"render_modes": []}
 
-    def __init__(self, data: dict[str, SymbolData], seed: int = 0,
+    def __init__(self, data: dict[str, SymbolData], ds: Dataset, seed: int = 0,
                  experience: list | None = None) -> None:
         super().__init__()
         self.observation_space = spaces.Box(
@@ -157,6 +190,7 @@ class HunterEnv(gym.Env):
         )
         self.action_space = spaces.Discrete(2)
         self._data = data
+        self._ds = ds
         self._rng = np.random.default_rng(seed)
         self._experience = experience
         self._steps = 0
@@ -175,19 +209,7 @@ class HunterEnv(gym.Env):
         return self._next_obs(), {}
 
     def step(self, action):
-        fwd = _forward_return(self._sd, self._t)
-        if action == ACTION_ACT:
-            # The live stop-loss caps real losses at ~5%; cap the training
-            # penalty identically so the learned risk:reward matches reality.
-            reward = max(fwd, -TRAIN_STOP_LOSS) - TRAIN_ROUND_TRIP_COST
-        else:
-            reward = (
-                MISSED_OPPORTUNITY_PENALTY
-                if fwd > MISSED_OPPORTUNITY_THRESHOLD
-                else 0.0
-            )
-        reward = float(np.clip(reward, -REWARD_CLIP, REWARD_CLIP))
-
+        reward = _entry_reward(self._sd, self._t, self._ds, action)
         self._steps += 1
         terminated = self._steps >= EPISODE_LEN
         return self._next_obs(), reward, terminated, False, {}
@@ -198,7 +220,10 @@ class GuardianEnv(gym.Env):
 
     metadata = {"render_modes": []}
 
-    TIME_PENALTY = -0.001
+    # v5: a gentler per-bar time penalty lets a winning position run long
+    # enough to amortise the round-trip cost over a bigger move (better
+    # reward:risk); the drawdown penalty still forces losers to be cut.
+    TIME_PENALTY = -0.0004
     DRAWDOWN_PENALTY_SCALE = 0.02
 
     def __init__(self, data: dict[str, SymbolData], seed: int = 0,
@@ -298,17 +323,7 @@ class ExecutiveEnv(gym.Env):
         return self._next_obs(), {}
 
     def step(self, action):
-        fwd = _forward_return(self._sd, self._t)
-        if action == ACTION_ACT:  # APPROVE
-            reward = max(fwd, -TRAIN_STOP_LOSS) - TRAIN_ROUND_TRIP_COST
-        else:  # SKIP
-            reward = (
-                MISSED_OPPORTUNITY_PENALTY
-                if fwd > MISSED_OPPORTUNITY_THRESHOLD
-                else 0.0
-            )
-        reward = float(np.clip(reward, -REWARD_CLIP, REWARD_CLIP))
-
+        reward = _entry_reward(self._sd, self._t, self._ds, action)
         self._steps += 1
         terminated = self._steps >= EPISODE_LEN
         return self._next_obs(), reward, terminated, False, {}
@@ -452,7 +467,7 @@ def main() -> None:
 
     def jobs_for(seed):
         return {
-            "hunter": (lambda: HunterEnv(ds.train, seed=seed, experience=exp_entry), HUNTER_FILE),
+            "hunter": (lambda: HunterEnv(ds.train, ds, seed=seed, experience=exp_entry), HUNTER_FILE),
             "guardian": (lambda: GuardianEnv(ds.train, seed=seed, experience=exp_hold), GUARDIAN_FILE),
             "executive": (lambda: ExecutiveEnv(ds.train, ds, seed=seed, experience=exp_entry), EXECUTIVE_FILE),
         }

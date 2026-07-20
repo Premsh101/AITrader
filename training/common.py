@@ -47,12 +47,25 @@ COST_BPS = 25.0
 COST_PER_SIDE = COST_BPS / 10_000.0
 ROUND_TRIP_COST = 2.0 * COST_PER_SIDE
 
-# TRAINING friction is deliberately doubled: a model that only learns edges
-# surviving 2x costs trades far more selectively.  EVALUATION always uses the
-# true ROUND_TRIP_COST.  (v1 failed the gate with 852 trades / -0.43% mean:
-# break-even gross, killed by friction.)
-TRAIN_COST_MULT = 2.0
+# TRAINING friction: a modest multiplier over the true cost gives the models
+# a small selectivity margin.  In v5 the dominant selectivity pressure comes
+# from the EXCESS-RETURN reward (below), not from inflating costs, so this is
+# 1.5 rather than the v2-v4 value of 2.0 (which over-suppressed trades when
+# combined with the benchmark subtraction).  EVALUATION always uses the true
+# ROUND_TRIP_COST.
+TRAIN_COST_MULT = 1.5
 TRAIN_ROUND_TRIP_COST = ROUND_TRIP_COST * TRAIN_COST_MULT
+
+# v5 CORE FIX — reward EXCESS return over the ^NSEI benchmark, not the raw
+# forward return.  The go/no-go gate is "beat buy-and-hold ^NSEI", so the
+# reward must optimise exactly that: a trade only earns reward for how much it
+# OUTPERFORMS the index over the holding window.  Buying a stock that rises
+# while the index rises just as much is worth ~0 (you could have held the
+# index for free); it is a LOSS after costs.  This is what forces genuine
+# selectivity — most stocks do NOT beat the index, so the models learn to
+# trade only the setups that do, instead of buying every up-drift (the v1-v4
+# overtrading disease: 350-850 trades, sub-40% win, always below baseline).
+REWARD_EXCESS_OVER_NIFTY = True
 
 # Data window (yfinance period string, ≥ 5y required).
 DATA_PERIOD = "6y"
@@ -61,11 +74,15 @@ DATA_PERIOD = "6y"
 # strictly after validates.  Default: 18 months before today.
 TRAIN_CUTOFF_MONTHS_BACK = 18
 
-# Forward horizon (bars) used by the Hunter/Executive reward.
-FORWARD_BARS = 5
+# Forward horizon (bars) used by the Hunter/Executive reward.  v5: 10 bars
+# (was 5) — matches the ~20-bar live hold better, halves the noise in the
+# excess-return signal, and lets a real trend show through the benchmark.
+FORWARD_BARS = 10
 
-# Hold penalised as a missed opportunity only when the forward return
-# exceeded this threshold.
+# Hold penalised as a missed opportunity only when the EXCESS forward return
+# (stock minus ^NSEI) exceeded this threshold — i.e. only skipping a genuine
+# outperformer is penalised, never skipping a stock that merely tracked the
+# index.
 MISSED_OPPORTUNITY_THRESHOLD = 0.03  # v2: only real moves count as missed
 MISSED_OPPORTUNITY_PENALTY = -0.005   # v2: patience is cheaper than churn
 
@@ -114,6 +131,7 @@ class Dataset:
     val: dict[str, SymbolData] = field(default_factory=dict)
     nifty_ret_5d: pd.Series | None = None      # indexed by date, full history
     nifty_close: pd.Series | None = None       # indexed by date, full history
+    nifty_fwd: pd.Series | None = None         # FORWARD FORWARD_BARS return
     cutoff: pd.Timestamp | None = None
 
 
@@ -183,6 +201,9 @@ def build_dataset(
         close = nifty_df["close"].astype(float)
         ds.nifty_close = close
         ds.nifty_ret_5d = close.pct_change(5).fillna(0.0)
+        # Forward FORWARD_BARS return of the index at each date (NaN at the
+        # tail).  Used only by the training reward to compute per-trade alpha.
+        ds.nifty_fwd = close.shift(-FORWARD_BARS) / close - 1.0
 
     for sym, df in ohlcv.items():
         if sym == to_base(NIFTY_TICKER):
@@ -225,5 +246,20 @@ def nifty_ret_lookup(ds: Dataset, when: pd.Timestamp) -> float:
         if pos < 0:
             return 0.0
         return float(ds.nifty_ret_5d.iloc[pos])
+    except Exception:
+        return 0.0
+
+
+def nifty_fwd_lookup(ds: Dataset, when: pd.Timestamp) -> float:
+    """Forward FORWARD_BARS ^NSEI return at *when* (the benchmark a trade
+    opened on this date must beat).  0.0 if unavailable or at the tail."""
+    if ds.nifty_fwd is None:
+        return 0.0
+    try:
+        pos = ds.nifty_fwd.index.get_indexer([when], method="ffill")[0]
+        if pos < 0:
+            return 0.0
+        v = ds.nifty_fwd.iloc[pos]
+        return float(v) if pd.notna(v) else 0.0
     except Exception:
         return 0.0
