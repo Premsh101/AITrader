@@ -474,7 +474,12 @@ def main() -> None:
 
     for variant in range(args.seeds):
         seed = args.seed + variant
-        suffix = f"_s{variant}" if args.seeds > 1 else ""
+        # Suffix by the ACTUAL seed number (not the loop index) so additional
+        # seed batches can be trained with --seed offsets WITHOUT overwriting
+        # earlier variants.  E.g. `--seed 0 --seeds 3` writes _s0/_s1/_s2 and a
+        # later `--seed 3 --seeds 3` writes _s3/_s4/_s5; tournament --seeds 6
+        # then grades all six.  (--seeds 1 keeps the plain, unsuffixed name.)
+        suffix = f"_s{seed}" if args.seeds > 1 else ""
         for name in args.brains:
             env_fn, filename = jobs_for(seed)[name]
             out_path = os.path.join(out_dir, filename.replace(".zip", f"{suffix}.zip"))
