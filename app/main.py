@@ -392,6 +392,15 @@ def _run_trading_cycle() -> None:
         selected = brains.executive.select_slots(
             buy_signals, executive_obs, available_slots
         )
+        # Make the Executive's narrowing visible in the activity log even when
+        # the entries are later blocked by an overlay (otherwise only the
+        # Hunter appears to be doing anything).
+        if buy_signals:
+            _log_activity(
+                "Executive",
+                f"Ranked {len(buy_signals)} candidate(s) → selected "
+                f"{len(selected)} for {available_slots} open slot(s)",
+            )
         rejected = [s for s in buy_signals if s not in selected]
         _record_ghosts(
             db, rejected,
