@@ -86,3 +86,10 @@ docker system prune -af        # remove dangling images/layers/build cache
 df -h /                        # confirm free space before redeploying
 ```
 A KVM with ~10 GB free is comfortable for build + run.
+
+**Container restarts in a loop / logs show `Could not parse SQLAlchemy URL
+from string ''` or `FATAL: DATABASE_URL is not set`.** The `DATABASE_URL`
+environment variable is empty — the app has no database to connect to. Set it
+in the Coolify **app service** environment to your Neon connection string
+(pooled, `sslmode=require`) and redeploy. This is the #1 first-deploy issue:
+the models seed fine, then migrations fail because the DB URL is missing.
