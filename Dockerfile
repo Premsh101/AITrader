@@ -51,7 +51,15 @@ WORKDIR /app
 RUN mkdir -p /app/models /app/logs
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Install the CPU-only PyTorch build FIRST, from PyTorch's CPU index, so the
+# multi-GB CUDA wheels are never pulled. Both inference and the self-learning
+# retrains run on CPU (the app forces device="cpu"), so the GPU libraries are
+# dead weight — and shipping them bloats the image by ~5 GB, which overflows
+# disk on modest deploy hosts during image unpack. requirements.txt then
+# installs everything else from PyPI; torch is already satisfied so SB3 does
+# not re-pull it.
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
+    && pip install --no-cache-dir -r requirements.txt
 
 # Bake the shipped model zips into a SEED directory (not /app/models itself).
 # At runtime /app/models is a persistent volume; entrypoint.sh copies these

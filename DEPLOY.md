@@ -74,3 +74,15 @@ behaviour.
   ship); that's expected while live trade/ghost history accumulates.
 - When you're ready to go live: fill the `SHOONYA_*` variables, then flip to
   LIVE from the dashboard (it requires an explicit confirm).
+
+## Troubleshooting
+
+**Deploy fails at image "unpacking" / build succeeds then errors, or the KVM
+runs low on disk.** The image ships CPU-only PyTorch (the app never uses a
+GPU), so it should be ~1.5–2 GB. If an earlier build pulled the CUDA wheels
+and filled the disk, reclaim space on the KVM and redeploy:
+```
+docker system prune -af        # remove dangling images/layers/build cache
+df -h /                        # confirm free space before redeploying
+```
+A KVM with ~10 GB free is comfortable for build + run.
