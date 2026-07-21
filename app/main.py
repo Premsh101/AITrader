@@ -550,7 +550,7 @@ async def lifespan(application: FastAPI):
     models_dir = os.environ.get("MODELS_DIR", "/app/models")
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     trainer_task = asyncio.create_task(
-        auto_trainer.weekend_loop(models_dir, repo_root, IST, _log_activity, brains)
+        auto_trainer.self_learning_loop(models_dir, repo_root, IST, _log_activity, brains)
     )
     logger.info(
         "Background trading loop started (interval=%ds, fetch TTL=%ds)",
