@@ -88,6 +88,11 @@ TRADING_LOOP_INTERVAL = int(os.environ.get("TRADING_LOOP_INTERVAL", "300"))
 FETCH_TTL_SECONDS = int(os.environ.get("FETCH_TTL_SECONDS", "900"))
 # Set TRADING_ALWAYS_ON=1 to bypass the market-hours gate (testing only).
 TRADING_ALWAYS_ON = os.environ.get("TRADING_ALWAYS_ON", "0") == "1"
+# Minutes of buffer around NSE hours during which the loop stays active. Outside
+# NSE hours ± this buffer the loop SLEEPS until the next session instead of
+# polling — this saves resources overnight/weekends and, importantly, means the
+# market-data API (Yahoo) is never hit outside trading hours (avoids blocks).
+MARKET_BUFFER_MIN = int(os.environ.get("MARKET_BUFFER_MIN", "15"))
 
 NIFTY_YAHOO = "^NSEI"
 
@@ -126,6 +131,40 @@ def _entries_allowed(now_ist: datetime) -> bool:
     until close."""
     minutes = now_ist.hour * 60 + now_ist.minute
     return minutes < (15 * 60 + 15)
+
+
+_MARKET_OPEN_MIN = 9 * 60 + 15    # 09:15 IST
+_MARKET_CLOSE_MIN = 15 * 60 + 30  # 15:30 IST
+
+
+def _within_active_window(now_ist: datetime) -> bool:
+    """True on weekdays within NSE hours ± MARKET_BUFFER_MIN. The trading loop
+    only does work (fetches data, runs the brains) inside this window."""
+    if now_ist.weekday() >= 5:  # Saturday / Sunday
+        return False
+    minutes = now_ist.hour * 60 + now_ist.minute
+    return (
+        (_MARKET_OPEN_MIN - MARKET_BUFFER_MIN)
+        <= minutes
+        <= (_MARKET_CLOSE_MIN + MARKET_BUFFER_MIN)
+    )
+
+
+def _seconds_until_active_window(now_ist: datetime) -> float:
+    """0.0 if already inside the active window, else seconds until it next
+    opens (rolling over evenings and weekends)."""
+    if _within_active_window(now_ist):
+        return 0.0
+    open_min = _MARKET_OPEN_MIN - MARKET_BUFFER_MIN
+    open_h, open_m = divmod(open_min, 60)
+    target = now_ist.replace(hour=open_h, minute=open_m, second=0, microsecond=0)
+    minutes = now_ist.hour * 60 + now_ist.minute
+    # Past today's open time, or it's the weekend → roll to a future day.
+    if minutes >= open_min or now_ist.weekday() >= 5:
+        target += timedelta(days=1)
+    while target.weekday() >= 5:  # skip Sat/Sun
+        target += timedelta(days=1)
+    return (target - now_ist).total_seconds()
 
 
 # ---------------------------------------------------------------------------
@@ -231,19 +270,30 @@ def _last_close(df) -> float | None:
 
 
 async def _trading_loop() -> None:
-    """Runs every TRADING_LOOP_INTERVAL seconds during market hours."""
+    """Active only during NSE hours ± MARKET_BUFFER_MIN; outside that window it
+    SLEEPS until the next session rather than polling, so the app consumes no
+    resources and never touches the market-data API outside trading hours."""
     while True:
-        await asyncio.sleep(TRADING_LOOP_INTERVAL)
-
-        now_ist = datetime.now(IST)
-        if not TRADING_ALWAYS_ON and not _is_market_open(now_ist):
-            logger.debug("Market closed (%s IST) – sleeping", now_ist.strftime("%H:%M"))
-            continue
+        if not TRADING_ALWAYS_ON:
+            wait = _seconds_until_active_window(datetime.now(IST))
+            if wait > 0:
+                logger.info(
+                    "Outside trading window – sleeping %.1f h until the next "
+                    "NSE session",
+                    wait / 3600,
+                )
+                # Cap each sleep at 1h so the loop re-evaluates periodically
+                # (robust to clock changes / long weekends) instead of one
+                # multi-day sleep.
+                await asyncio.sleep(min(wait, 3600.0))
+                continue
 
         try:
             await asyncio.to_thread(_run_trading_cycle)
         except Exception:
             logger.exception("Unhandled error in trading loop")
+
+        await asyncio.sleep(TRADING_LOOP_INTERVAL)
 
 
 def _run_trading_cycle() -> None:
@@ -410,6 +460,16 @@ def _run_trading_cycle() -> None:
 
         is_live = config.is_live_mode
         mode = TradeMode.LIVE if is_live else TradeMode.PAPER
+
+        # In the pre-open / post-close buffer the loop still runs (data +
+        # Guardian management), but NEW entries are only placed while the
+        # exchange is genuinely open.
+        if selected and not TRADING_ALWAYS_ON and not _is_market_open(now_ist):
+            _log_activity(
+                "Executive",
+                f"Market not open – holding {len(selected)} entry(ies) for the session",
+            )
+            selected = []
 
         if selected and not TRADING_ALWAYS_ON and not _entries_allowed(now_ist):
             _log_activity(
